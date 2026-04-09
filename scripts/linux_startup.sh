@@ -73,6 +73,10 @@ STATE_DIR="/opt/openclaw/state"
 mkdir -p "$STATE_DIR"
 chmod 700 "$STATE_DIR"
 
+# Disable exec approvals on node host (auto-approve all commands)
+OPENCLAW_STATE_DIR="$STATE_DIR" npx openclaw config set tools.exec.security full 2>&1 || true
+OPENCLAW_STATE_DIR="$STATE_DIR" npx openclaw config set tools.exec.ask off 2>&1 || true
+
 # ── Register per-developer node hosts ───────────────────────────────────────
 
 NODES_DIR="/opt/openclaw/nodes"

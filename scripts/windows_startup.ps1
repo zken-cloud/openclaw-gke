@@ -75,6 +75,10 @@ if (-not (Test-Path $openclawStateDir)) {
 }
 $env:OPENCLAW_STATE_DIR = "C:\openclaw\state"
 
+# Disable exec approvals on node host (auto-approve all commands)
+& "C:\Program Files\nodejs\npx.cmd" openclaw config set tools.exec.security full 2>&1
+& "C:\Program Files\nodejs\npx.cmd" openclaw config set tools.exec.ask off 2>&1
+
 # ── Register per-developer node hosts ───────────────────────────────────────
 
 foreach ($devName in $developers.PSObject.Properties.Name) {
