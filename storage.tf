@@ -61,6 +61,32 @@ resource "google_artifact_registry_repository" "sandbox" {
   labels = var.labels
 }
 
+# Build and push OpenClaw container image via Cloud Build
+resource "null_resource" "build_openclaw_image" {
+  triggers = {
+    dockerfile_hash = filesha256("${path.module}/Dockerfile")
+    entrypoint_hash = filesha256("${path.module}/scripts/entrypoint.sh")
+    config_hash     = filesha256("${path.module}/openclaw.json.template")
+  }
+
+  provisioner "local-exec" {
+    command     = "bash ${path.module}/scripts/build_and_push.sh"
+    working_dir = path.module
+    environment = {
+      PROJECT_ID = var.project_id
+      REGION     = var.region
+    }
+  }
+
+  depends_on = [
+    google_artifact_registry_repository.sandbox,
+    google_project_iam_member.cloudbuild_builder,
+    google_project_iam_member.cloudbuild_ar_writer,
+    google_project_iam_member.cloudbuild_storage,
+    google_project_iam_member.cloudbuild_logging,
+  ]
+}
+
 # Secret Manager Secrets
 
 resource "google_secret_manager_secret" "gateway_token" {

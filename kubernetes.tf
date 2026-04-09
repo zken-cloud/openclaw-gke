@@ -211,7 +211,7 @@ resource "kubernetes_deployment" "openclaw_brain" {
 
   wait_for_rollout = false
 
-  depends_on = [time_sleep.kata_ready]
+  depends_on = [time_sleep.kata_ready, null_resource.build_openclaw_image]
 
   spec {
     replicas = each.value.active ? 1 : 0

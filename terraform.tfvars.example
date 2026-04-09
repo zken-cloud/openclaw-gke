@@ -44,6 +44,6 @@ model_fallbacks  = "[\"litellm/gemini-3.1-flash-lite-preview\"]"
 # OS is auto-detected from the image name.
 
 # exec_vms = {
-#   "windows" = { os_image = "windows-cloud/windows-2022-core" }
+#   "windows" = { os_image = "windows-cloud/windows-2022" }
 #   "linux"   = { os_image = "debian-cloud/debian-12", machine_type = "e2-standard-2" }
 # }
