@@ -666,9 +666,48 @@ kubectl describe sa openclaw-brain -n openclaw | grep annotation
 
 ## Channel Configuration
 
-OpenClaw supports 20+ channels including Telegram, WhatsApp, Slack, Discord, Signal, Google Chat, Microsoft Teams, and more. All channels are configured via the **Control UI** -- no SSH or VM access required.
+OpenClaw supports 20+ channels including Telegram, WhatsApp, Slack, Discord, Signal, Google Chat, Microsoft Teams, and more. Channels are configured via **CLI commands** or the **Control UI** -- no SSH or VM access required.
 
-### Accessing the Control UI
+### Option 1: CLI via kubectl exec (Recommended)
+
+Run `openclaw` commands directly inside the gateway pod from your Cloud Shell or local terminal:
+
+```bash
+# Add Telegram
+kubectl exec -n openclaw deploy/openclaw-alice -- \
+  openclaw channels add telegram --bot-token "YOUR_BOT_TOKEN"
+
+# Add Discord
+kubectl exec -n openclaw deploy/openclaw-alice -- \
+  openclaw channels add discord --bot-token "YOUR_DISCORD_TOKEN"
+
+# Add Slack
+kubectl exec -n openclaw deploy/openclaw-alice -- \
+  openclaw channels add slack --app-token "xapp-..." --bot-token "xoxb-..."
+
+# Add WhatsApp (interactive -- displays QR code in terminal)
+kubectl exec -it -n openclaw deploy/openclaw-alice -- \
+  openclaw channels add whatsapp
+```
+
+**Manage existing channels:**
+
+```bash
+# List configured channels
+kubectl exec -n openclaw deploy/openclaw-alice -- openclaw channels list
+
+# Check channel status
+kubectl exec -n openclaw deploy/openclaw-alice -- openclaw channels status
+
+# Remove a channel
+kubectl exec -n openclaw deploy/openclaw-alice -- openclaw channels remove
+
+# Update a channel setting
+kubectl exec -n openclaw deploy/openclaw-alice -- \
+  openclaw config set channels.telegram.dmPolicy "pairing"
+```
+
+### Option 2: Control UI (Web Interface)
 
 Each developer's gateway pod exposes the Control UI on port 18789 via the Internal Load Balancer:
 
@@ -688,14 +727,12 @@ kubectl get svc -n openclaw -l component=brain
 > # Then open http://localhost:18789
 > ```
 
-### Adding a Channel
-
 1. Open the Control UI in your browser
 2. Navigate to the **Configuration** tab
 3. Add your channel under the `channels` key using the Raw JSON editor or form fields
 4. The gateway hot-reloads configuration changes -- no restart needed
 
-Example channel configurations:
+### Example Channel Configurations
 
 **Telegram:**
 ```json
@@ -715,7 +752,7 @@ Example channel configurations:
   }
 }
 ```
-After adding WhatsApp, scan the QR code displayed in the Control UI to authenticate.
+After adding WhatsApp, scan the QR code displayed in the Control UI or via `kubectl exec -it`.
 
 **Slack:**
 ```json
@@ -728,23 +765,12 @@ After adding WhatsApp, scan the QR code displayed in the Control UI to authentic
 }
 ```
 
-### Channel Management via API
-
-You can also configure channels programmatically using the gateway WebSocket API:
-
-```bash
-openclaw gateway call config.patch --params '{
-  "raw": "{ channels: { telegram: { enabled: true, token: \"YOUR_TOKEN\" } } }",
-  "baseHash": "<current-config-hash>"
-}'
-```
-
 ### Supported Channels
 
 | Channel | Auth Method |
 |---------|-------------|
 | Telegram | Bot token (from @BotFather) |
-| WhatsApp | QR code scan via Control UI |
+| WhatsApp | QR code scan (Control UI or `kubectl exec -it`) |
 | Slack | App token + Bot token |
 | Discord | Bot token |
 | Signal | Linked device (QR code) |

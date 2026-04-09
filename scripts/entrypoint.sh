@@ -14,8 +14,16 @@ STATE_DIR="${OPENCLAW_STATE_DIR:-$HOME/.openclaw}"
 umask 077
 mkdir -p "$STATE_DIR"
 
-# Always deploy the latest config from the template
-cp /app/openclaw.json "$STATE_DIR/openclaw.json"
+# Merge template with existing config, preserving user-managed keys (e.g. channels)
+if [ -f "$STATE_DIR/openclaw.json" ]; then
+  # Preserve channels and pairing data added by the user via CLI/Control UI.
+  # Template wins for infra keys (gateway, models, tools, agents, etc).
+  jq -s '.[1] as $existing | .[0] * { channels: ($existing.channels // {}) }' \
+    /app/openclaw.json "$STATE_DIR/openclaw.json" > "$STATE_DIR/openclaw.json.tmp" \
+    && mv "$STATE_DIR/openclaw.json.tmp" "$STATE_DIR/openclaw.json"
+else
+  cp /app/openclaw.json "$STATE_DIR/openclaw.json"
+fi
 
 # Safety check: gateway.bind MUST be "lan" for ILB and node host connectivity.
 # "auto" resolves to loopback-only which breaks kube-proxy forwarding.
