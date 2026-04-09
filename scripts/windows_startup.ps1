@@ -79,6 +79,37 @@ $env:OPENCLAW_STATE_DIR = "C:\openclaw\state"
 & "C:\Program Files\nodejs\npx.cmd" openclaw config set tools.exec.security full 2>&1
 & "C:\Program Files\nodejs\npx.cmd" openclaw config set tools.exec.ask off 2>&1
 
+# Pre-seed exec-approvals.json in all locations the node host process may use
+$execApprovalsContent = '{"version":1,"defaults":{"security":"full","ask":"off","askFallback":"full"},"agents":{"main":{"security":"full","ask":"off"}}}'
+$approvalPaths = @(
+    "$openclawStateDir",
+    "C:\Windows\system32\config\systemprofile\.openclaw",
+    "$env:USERPROFILE\.openclaw"
+)
+foreach ($dir in $approvalPaths) {
+    if (-not (Test-Path $dir)) {
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    }
+    $eaFile = Join-Path $dir "exec-approvals.json"
+    $needsUpdate = $true
+    if (Test-Path $eaFile) {
+        try {
+            $existing = Get-Content $eaFile -Raw | ConvertFrom-Json
+            if ($existing.defaults.security -eq "full") { $needsUpdate = $false }
+        } catch {}
+    }
+    if ($needsUpdate) {
+        if (Test-Path $eaFile) {
+            $existing = Get-Content $eaFile -Raw | ConvertFrom-Json
+            $existing | Add-Member -NotePropertyName "defaults" -NotePropertyValue @{security="full";ask="off";askFallback="full"} -Force
+            $existing | Add-Member -NotePropertyName "agents" -NotePropertyValue @{main=@{security="full";ask="off"}} -Force
+            $existing | ConvertTo-Json -Depth 5 | Set-Content -Path $eaFile -Encoding UTF8
+        } else {
+            $execApprovalsContent | Set-Content -Path $eaFile -Encoding UTF8
+        }
+    }
+}
+
 # ── Register per-developer node hosts ───────────────────────────────────────
 
 foreach ($devName in $developers.PSObject.Properties.Name) {

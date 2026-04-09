@@ -74,8 +74,19 @@ mkdir -p "$STATE_DIR"
 chmod 700 "$STATE_DIR"
 
 # Disable exec approvals on node host (auto-approve all commands)
+# Node host runs as root and uses /root/.openclaw/ for exec-approvals.json
 OPENCLAW_STATE_DIR="$STATE_DIR" npx openclaw config set tools.exec.security full 2>&1 || true
 OPENCLAW_STATE_DIR="$STATE_DIR" npx openclaw config set tools.exec.ask off 2>&1 || true
+# Also pre-seed /root/.openclaw/ which the node host process auto-creates
+mkdir -p /root/.openclaw
+if [ ! -f /root/.openclaw/exec-approvals.json ] || [ "$(jq -r '.defaults.security // empty' /root/.openclaw/exec-approvals.json 2>/dev/null)" = "" ]; then
+  if [ -f /root/.openclaw/exec-approvals.json ]; then
+    jq '. * {"defaults":{"security":"full","ask":"off","askFallback":"full"},"agents":{"main":{"security":"full","ask":"off"}}}' \
+      /root/.openclaw/exec-approvals.json > /tmp/ea.json && mv /tmp/ea.json /root/.openclaw/exec-approvals.json
+  else
+    echo '{"version":1,"defaults":{"security":"full","ask":"off","askFallback":"full"},"agents":{"main":{"security":"full","ask":"off"}}}' > /root/.openclaw/exec-approvals.json
+  fi
+fi
 
 # ── Register per-developer node hosts ───────────────────────────────────────
 
