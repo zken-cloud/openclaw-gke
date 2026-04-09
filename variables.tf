@@ -107,13 +107,6 @@ variable "exec_vms" {
 # Secrets
 # ──────────────────────────────────────────────────────────────────────────────
 
-variable "telegram_bot_token" {
-  description = "Telegram bot token (stored in Secret Manager, never in plaintext config). Leave empty to skip Telegram integration."
-  type        = string
-  sensitive   = true
-  default     = ""
-}
-
 variable "gateway_auth_token" {
   description = "OpenClaw gateway auth token. Leave empty to auto-generate a 48-char hex token."
   type        = string

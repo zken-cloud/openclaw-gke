@@ -12,7 +12,7 @@ Terraform-managed infrastructure for deploying OpenClaw on Google Cloud Platform
 - [End-to-End Testing](#end-to-end-testing)
   - [Connecting to the GKE Cluster](#connecting-to-the-gke-cluster)
   - [Troubleshooting](#troubleshooting)
-- [Telegram Channel Integration](#telegram-channel-integration)
+- [Channel Configuration](#channel-configuration)
 - [Windows VM Golden Image](#windows-vm-golden-image)
 - [Variables Reference](#variables-reference)
 - [Outputs Reference](#outputs-reference)
@@ -40,7 +40,7 @@ graph TD
             BOB_POD --> LITELLM
         end
 
-        SM["Secret Manager<br/>gateway-token / telegram-token / brave-key"]
+        SM["Secret Manager<br/>gateway-token / brave-key"]
         AR["Artifact Registry<br/>Docker Images"]
         NAT["Cloud NAT<br/>Outbound Only"]
         VERTEX["Vertex AI<br/>Gemini 3.1 Pro / Flash"]
@@ -75,7 +75,7 @@ graph TD
             NH_BOB["Node Host: bob"]
         end
 
-        SM["Secret Manager<br/>gateway-token / telegram-token / brave-key"]
+        SM["Secret Manager<br/>gateway-token / brave-key"]
         AR["Artifact Registry<br/>Docker Images"]
         NAT["Cloud NAT<br/>Outbound Only"]
         VERTEX["Vertex AI<br/>Gemini 3.1 Pro / Flash"]
@@ -98,7 +98,7 @@ graph TD
 | **Execution VM** *(optional)* | Executes OS-native commands dispatched by agents (Windows: PowerShell/CMD, Linux: bash) | GCE, Shielded VM, no public IP |
 | **Node Hosts** *(optional)* | Per-developer `openclaw node run` processes on the execution VM, connecting back to gateway pods over TLS WebSocket | Windows: Scheduled Tasks, Linux: systemd services |
 | **Internal Load Balancers** *(optional)* | Per-developer ILBs allowing VM node hosts to reach gateway pods inside GKE | GKE Service (type: LoadBalancer, internal) |
-| **Secret Manager** | Stores gateway auth token, Telegram bot token, Brave API key | GCP managed service |
+| **Secret Manager** | Stores gateway auth token, Brave API key | GCP managed service |
 | **Artifact Registry** | Private Docker registry for OpenClaw container images | GCP managed service |
 | **Cloud NAT** | Outbound internet for pods and VMs (no public IPs on any resource) | GCP managed service |
 
@@ -244,7 +244,7 @@ developers = {
 
 ### Secrets Management
 
-- **GCP Secret Manager** for all credentials (gateway token, Telegram token, Brave API key)
+- **GCP Secret Manager** for all credentials (gateway token, Brave API key)
 - **Auto-generated gateway token** -- 48-char hex token if not provided
 - **TF_VAR environment variables** for sensitive inputs (never in `terraform.tfvars`)
 - **Remote state** -- GCS backend with versioning (configure bucket via `terraform init -backend-config="bucket=YOUR_BUCKET"`)
@@ -383,7 +383,6 @@ developers = {
 Set sensitive variables via environment:
 
 ```bash
-export TF_VAR_telegram_bot_token="your-telegram-bot-token"  # optional
 export TF_VAR_gateway_auth_token=""  # leave empty to auto-generate
 export TF_VAR_brave_api_key=""       # optional
 ```
@@ -665,112 +664,96 @@ kubectl describe sa openclaw-brain -n openclaw | grep annotation
 
 ---
 
-## Telegram Channel Integration
+## Channel Configuration
 
-### Step 1: Create a Telegram Bot
+OpenClaw supports 20+ channels including Telegram, WhatsApp, Slack, Discord, Signal, Google Chat, Microsoft Teams, and more. All channels are configured via the **Control UI** -- no SSH or VM access required.
 
-1. Open Telegram and message [@BotFather](https://t.me/BotFather)
-2. Send `/newbot` and follow the prompts to choose a name and username
-3. BotFather returns a token like: `123456789:AAExxxxxxxxxxxxxxxxxxxxxxxxxxxxxx`
-4. Save this token -- do not commit it to version control
+### Accessing the Control UI
 
-### Step 2: Store the Token
+Each developer's gateway pod exposes the Control UI on port 18789 via the Internal Load Balancer:
 
-**Via environment variable (recommended):**
-
-```bash
-export TF_VAR_telegram_bot_token="123456789:AAExxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-terraform apply
+```
+http://<ILB_IP>:18789
 ```
 
-Terraform creates the `openclaw-telegram-bot-token` secret in Secret Manager with proper per-secret IAM bindings.
-
-**Via gcloud CLI (after deployment):**
+To find your ILB IP:
 
 ```bash
-echo -n "YOUR_TOKEN" | gcloud secrets create openclaw-telegram-bot-token \
-  --project=my-gcp-project \
-  --replication-policy=automatic \
-  --data-file=-
-
-gcloud secrets add-iam-policy-binding openclaw-telegram-bot-token \
-  --project=my-gcp-project \
-  --role=roles/secretmanager.secretAccessor \
-  --member="serviceAccount:openclaw-brain@my-gcp-project.iam.gserviceaccount.com"
+kubectl get svc -n openclaw -l component=brain
 ```
 
-### Step 3: Configure the Channel
+> **Note:** The Control UI is only accessible from networks included in the VPC routing (GKE subnet, exec VM subnet). Use `kubectl port-forward` if accessing from outside the VPC:
+> ```bash
+> kubectl port-forward -n openclaw svc/openclaw-alice 18789:18789
+> # Then open http://localhost:18789
+> ```
 
-Update `openclaw.json.template` to add the Telegram channel:
+### Adding a Channel
 
+1. Open the Control UI in your browser
+2. Navigate to the **Configuration** tab
+3. Add your channel under the `channels` key using the Raw JSON editor or form fields
+4. The gateway hot-reloads configuration changes -- no restart needed
+
+Example channel configurations:
+
+**Telegram:**
 ```json
 "channels": {
   "telegram": {
     "enabled": true,
-    "tokenSecret": "openclaw-telegram-bot-token",
-    "dmPolicy": "pairing",
-    "groupPolicy": "allowlist",
-    "streaming": "partial"
+    "token": "123456789:AAExxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
   }
 }
 ```
 
-Update `entrypoint.sh` to fetch the Telegram token from Secret Manager at runtime and write it to a file:
-
-```bash
-# After the existing config setup, add:
-TELEGRAM_TOKEN=$(gcloud secrets versions access latest \
-  --secret="openclaw-telegram-bot-token" --quiet 2>/dev/null || echo "")
-if [ -n "$TELEGRAM_TOKEN" ]; then
-  echo -n "$TELEGRAM_TOKEN" > "$STATE_DIR/telegram-bot-token.txt"
-fi
-```
-
-Then update the channel config to reference the token file:
-
+**WhatsApp (Baileys):**
 ```json
 "channels": {
-  "telegram": {
+  "whatsapp": {
+    "enabled": true
+  }
+}
+```
+After adding WhatsApp, scan the QR code displayed in the Control UI to authenticate.
+
+**Slack:**
+```json
+"channels": {
+  "slack": {
     "enabled": true,
-    "tokenFile": "/app/workspace/.openclaw-state/telegram-bot-token.txt",
-    "dmPolicy": "pairing",
-    "groupPolicy": "allowlist",
-    "streaming": "partial"
+    "appToken": "xapp-...",
+    "botToken": "xoxb-..."
   }
 }
 ```
 
-### Step 4: Rebuild and Deploy
+### Channel Management via API
+
+You can also configure channels programmatically using the gateway WebSocket API:
 
 ```bash
-export PROJECT_ID="my-gcp-project"
-export REGION="asia-southeast1"
-./scripts/build_and_push.sh
-
-kubectl rollout restart deployment -n openclaw -l component=brain
+openclaw gateway call config.patch --params '{
+  "raw": "{ channels: { telegram: { enabled: true, token: \"YOUR_TOKEN\" } } }",
+  "baseHash": "<current-config-hash>"
+}'
 ```
 
-### Step 5: Pair with the Bot
+### Supported Channels
 
-1. Open Telegram and start a chat with your bot
-2. Send `/start` -- the bot will respond with a pairing code
-3. Complete pairing via the TUI or agent CLI
-4. You can now interact with your OpenClaw agent through Telegram
+| Channel | Auth Method |
+|---------|-------------|
+| Telegram | Bot token (from @BotFather) |
+| WhatsApp | QR code scan via Control UI |
+| Slack | App token + Bot token |
+| Discord | Bot token |
+| Signal | Linked device (QR code) |
+| Google Chat | Service account |
+| Microsoft Teams | App credentials |
+| IRC | Server/nick config |
+| Matrix | Homeserver + access token |
 
-### Rotating the Telegram Token
-
-```bash
-# Add a new version
-echo -n "NEW_TOKEN" | gcloud secrets versions add openclaw-telegram-bot-token \
-  --project=my-gcp-project --data-file=-
-
-# Restart pods to pick up the new version
-kubectl rollout restart deployment -n openclaw -l component=brain
-
-# Disable old version (optional)
-gcloud secrets versions disable OLD_VERSION --secret=openclaw-telegram-bot-token \
-  --project=my-gcp-project
-```
+For full channel documentation, see the [OpenClaw Channels docs](https://docs.openclaw.ai/channels).
 
 ---
 
@@ -946,7 +929,6 @@ gcloud scheduler jobs create http openclaw-golden-image-rebuild \
 | `master_authorized_cidrs` | No | `{}` | Additional CIDRs allowed to access GKE control plane |
 | `exec_vm_subnet_cidr` | No | `10.20.0.0/24` | VM subnet CIDR |
 | **Secrets** | | | |
-| `telegram_bot_token` | No | `""` | Telegram bot token (sensitive, use `TF_VAR_`) |
 | `gateway_auth_token` | No | auto-generated | Gateway auth token (sensitive) |
 | `brave_api_key` | No | `""` | Brave Search API key (sensitive) |
 | **OpenClaw** | | | |

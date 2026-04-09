@@ -43,7 +43,6 @@ output "secrets_configured" {
   sensitive   = true
   value = concat(
     [google_secret_manager_secret.gateway_token.secret_id],
-    var.telegram_bot_token != "" ? [google_secret_manager_secret.telegram_bot_token[0].secret_id] : [],
     var.brave_api_key != "" ? [google_secret_manager_secret.brave_api_key[0].secret_id] : []
   )
 }

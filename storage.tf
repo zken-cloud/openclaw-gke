@@ -103,24 +103,3 @@ resource "google_secret_manager_secret_version" "brave_api_key" {
   secret_data = var.brave_api_key
 }
 
-resource "google_secret_manager_secret" "telegram_bot_token" {
-  count = var.telegram_bot_token != "" ? 1 : 0
-
-  secret_id = "openclaw-telegram-bot-token"
-  project   = var.project_id
-
-  replication {
-    auto {}
-  }
-
-  labels = var.labels
-
-  depends_on = [google_project_service.apis["secretmanager.googleapis.com"]]
-}
-
-resource "google_secret_manager_secret_version" "telegram_bot_token" {
-  count = var.telegram_bot_token != "" ? 1 : 0
-
-  secret      = google_secret_manager_secret.telegram_bot_token[0].id
-  secret_data = var.telegram_bot_token
-}

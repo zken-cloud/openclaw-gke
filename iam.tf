@@ -41,14 +41,6 @@ resource "google_secret_manager_secret_iam_member" "brain_gateway_token_accessor
   member    = "serviceAccount:${google_service_account.openclaw_brain.email}"
 }
 
-resource "google_secret_manager_secret_iam_member" "brain_telegram_accessor" {
-  count     = var.telegram_bot_token != "" ? 1 : 0
-  secret_id = google_secret_manager_secret.telegram_bot_token[0].secret_id
-  project   = var.project_id
-  role      = "roles/secretmanager.secretAccessor"
-  member    = "serviceAccount:${google_service_account.openclaw_brain.email}"
-}
-
 resource "google_secret_manager_secret_iam_member" "brain_brave_accessor" {
   count     = var.brave_api_key != "" ? 1 : 0
   secret_id = google_secret_manager_secret.brave_api_key[0].secret_id

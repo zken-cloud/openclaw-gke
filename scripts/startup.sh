@@ -27,7 +27,6 @@ SANDBOX_IMAGE="${sandbox_image}"
 MODEL_PRIMARY="${model_primary}"
 MODEL_FALLBACKS='${model_fallbacks}'
 HAS_BRAVE_API_KEY="${has_brave_api_key}"
-HAS_TELEGRAM="${has_telegram}"
 
 OPENCLAW_USER="openclaw"
 OPENCLAW_HOME="/home/$OPENCLAW_USER"
