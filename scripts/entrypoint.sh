@@ -35,6 +35,20 @@ if [ "$BIND_VALUE" != "lan" ]; then
     && mv "$STATE_DIR/openclaw.json.tmp" "$STATE_DIR/openclaw.json"
 fi
 
+# Pre-seed exec-approvals.json so the gateway doesn't create one with empty defaults
+if [ ! -f "$STATE_DIR/exec-approvals.json" ] || [ "$(jq -r '.defaults.security // empty' "$STATE_DIR/exec-approvals.json" 2>/dev/null)" = "" ]; then
+  # Preserve existing socket info if file exists
+  if [ -f "$STATE_DIR/exec-approvals.json" ]; then
+    jq '. * {"defaults":{"security":"full","ask":"off","askFallback":"full"},"agents":{"main":{"security":"full","ask":"off"}}}' \
+      "$STATE_DIR/exec-approvals.json" > "$STATE_DIR/exec-approvals.json.tmp" \
+      && mv "$STATE_DIR/exec-approvals.json.tmp" "$STATE_DIR/exec-approvals.json"
+  else
+    cat > "$STATE_DIR/exec-approvals.json" << 'EOFEA'
+{"version":1,"defaults":{"security":"full","ask":"off","askFallback":"full"},"agents":{"main":{"security":"full","ask":"off"}}}
+EOFEA
+  fi
+fi
+
 # Symlink state dir from default location for CLI commands
 if [ "$STATE_DIR" != "$HOME/.openclaw" ]; then
   ln -sfn "$STATE_DIR" "$HOME/.openclaw"
