@@ -67,66 +67,13 @@ Write-Output "Gateway token retrieved from Secret Manager."
 $env:OPENCLAW_GATEWAY_TOKEN = $gatewayToken
 
 
-# ── Configure exec approvals for node host (auto-approve) ──────────────────
+# ── Set up state directory ──────────────────────────────────────────────────
 
 $openclawStateDir = "C:\openclaw\state"
 if (-not (Test-Path $openclawStateDir)) {
     New-Item -ItemType Directory -Path $openclawStateDir -Force | Out-Null
 }
-
-$execApprovalsJson = @"
-{
-  "version": 1,
-  "defaults": {
-    "security": "full",
-    "ask": "off",
-    "askFallback": "full",
-    "autoAllowSkills": true
-  },
-  "agents": {
-    "main": {
-      "security": "full",
-      "ask": "off",
-      "askFallback": "full",
-      "allowlist": [
-        {"pattern": "hostname"},
-        {"pattern": "ipconfig*"},
-        {"pattern": "systeminfo*"},
-        {"pattern": "dir*"},
-        {"pattern": "type*"},
-        {"pattern": "whoami*"},
-        {"pattern": "echo*"},
-        {"pattern": "powershell*"},
-        {"pattern": "cmd*"}
-      ]
-    }
-  }
-}
-"@
-# Write to multiple possible locations the node host might check
-$execApprovalsJson | Set-Content -Path "$openclawStateDir\exec-approvals.json" -Encoding UTF8
-
-# Also write to SYSTEM profile .openclaw dir
-$systemProfile = "C:\Windows\system32\config\systemprofile\.openclaw"
-if (-not (Test-Path $systemProfile)) {
-    New-Item -ItemType Directory -Path $systemProfile -Force | Out-Null
-}
-$execApprovalsJson | Set-Content -Path "$systemProfile\exec-approvals.json" -Encoding UTF8
-
-# And to the global npm config location
-$npmGlobal = "C:\Users\SYSTEM\.openclaw"
-if (-not (Test-Path $npmGlobal)) {
-    New-Item -ItemType Directory -Path $npmGlobal -Force | Out-Null
-}
-$execApprovalsJson | Set-Content -Path "$npmGlobal\exec-approvals.json" -Encoding UTF8
-Write-Output "Exec approvals configured for auto-approve."
-
-# Configure exec approvals via CLI
 $env:OPENCLAW_STATE_DIR = "C:\openclaw\state"
-& "C:\Program Files\nodejs\npx.cmd" openclaw approvals set "$openclawStateDir\exec-approvals.json" 2>&1
-& "C:\Program Files\nodejs\npx.cmd" openclaw config set tools.exec.security full 2>&1
-& "C:\Program Files\nodejs\npx.cmd" openclaw config set tools.exec.ask off 2>&1
-Write-Output "Exec approvals set via CLI."
 
 # ── Register per-developer node hosts ───────────────────────────────────────
 

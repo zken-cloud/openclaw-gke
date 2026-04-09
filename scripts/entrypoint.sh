@@ -35,27 +35,7 @@ if [ "$BIND_VALUE" != "lan" ]; then
     && mv "$STATE_DIR/openclaw.json.tmp" "$STATE_DIR/openclaw.json"
 fi
 
-# Configure exec approvals for auto-approve on gateway side
-if [ ! -f "$STATE_DIR/exec-approvals.json" ] || ! grep -q '"security": "full"' "$STATE_DIR/exec-approvals.json" 2>/dev/null; then
-  cat > "$STATE_DIR/exec-approvals.json" << 'EOFEA'
-{
-  "version": 1,
-  "defaults": {
-    "security": "full",
-    "ask": "off",
-    "askFallback": "full"
-  },
-  "agents": {
-    "main": {
-      "security": "full",
-      "ask": "off"
-    }
-  }
-}
-EOFEA
-fi
-
-# Also symlink from default location for CLI commands
+# Symlink state dir from default location for CLI commands
 if [ "$STATE_DIR" != "$HOME/.openclaw" ]; then
   ln -sfn "$STATE_DIR" "$HOME/.openclaw"
 fi

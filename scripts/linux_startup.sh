@@ -67,62 +67,11 @@ if [ $? -ne 0 ]; then
 fi
 echo "Gateway token retrieved from Secret Manager."
 
-# ── Configure exec approvals for node host (auto-approve) ──────────────────
+# ── Set up state directory ──────────────────────────────────────────────────
 
 STATE_DIR="/opt/openclaw/state"
 mkdir -p "$STATE_DIR"
 chmod 700 "$STATE_DIR"
-
-cat > "$STATE_DIR/exec-approvals.json" << 'EOFEA'
-{
-  "version": 1,
-  "defaults": {
-    "security": "full",
-    "ask": "off",
-    "askFallback": "full",
-    "autoAllowSkills": true
-  },
-  "agents": {
-    "main": {
-      "security": "full",
-      "ask": "off",
-      "askFallback": "full",
-      "allowlist": [
-        {"pattern": "hostname"},
-        {"pattern": "uname*"},
-        {"pattern": "whoami*"},
-        {"pattern": "ls*"},
-        {"pattern": "cat*"},
-        {"pattern": "echo*"},
-        {"pattern": "bash*"},
-        {"pattern": "sh*"},
-        {"pattern": "python3*"},
-        {"pattern": "pip3*"},
-        {"pattern": "node*"},
-        {"pattern": "npm*"},
-        {"pattern": "git*"},
-        {"pattern": "curl*"},
-        {"pattern": "wget*"},
-        {"pattern": "grep*"},
-        {"pattern": "find*"},
-        {"pattern": "head*"},
-        {"pattern": "tail*"},
-        {"pattern": "sort*"},
-        {"pattern": "wc*"},
-        {"pattern": "df*"},
-        {"pattern": "free*"},
-        {"pattern": "ps*"},
-        {"pattern": "systemctl*"}
-      ]
-    }
-  }
-}
-EOFEA
-
-OPENCLAW_STATE_DIR="$STATE_DIR" npx openclaw approvals set "$STATE_DIR/exec-approvals.json" 2>&1 || true
-OPENCLAW_STATE_DIR="$STATE_DIR" npx openclaw config set tools.exec.security full 2>&1 || true
-OPENCLAW_STATE_DIR="$STATE_DIR" npx openclaw config set tools.exec.ask off 2>&1 || true
-echo "Exec approvals configured for auto-approve."
 
 # ── Register per-developer node hosts ───────────────────────────────────────
 

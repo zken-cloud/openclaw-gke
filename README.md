@@ -253,7 +253,7 @@ developers = {
 
 - **TLS with fingerprint pinning** -- self-signed ECDSA P256 cert, SHA256 fingerprint validated by node hosts
 - **Token authentication** -- gateway requires auth token for all connections
-- **Exec security** -- gateway and node hosts use `full` security with `ask: "off"` (auto-approve); configurable per-agent via `exec-approvals.json`
+- **Exec security** -- configurable per-agent via `exec-approvals.json` (see [Exec Approval Configuration](#exec-approval-configuration))
 - **Restricted envsubst** -- only named variables substituted (`$MODEL_PRIMARY,$MODEL_FALLBACKS,$GATEWAY_AUTH_TOKEN`)
 - **Container vulnerability scanning** -- `containerscanning.googleapis.com` API enabled on Artifact Registry
 - **Pinned LiteLLM image** -- SHA256 digest, not mutable tag
@@ -262,7 +262,9 @@ developers = {
 
 ### Exec Approval Configuration
 
-OpenClaw has a two-layer exec approval system — both the **gateway** and each **node host** independently control whether commands require approval. This deployment pre-configures both sides for auto-approve via `exec-approvals.json`.
+OpenClaw has a two-layer exec approval system — both the **gateway** and each **node host** independently control whether commands require approval. By default, this deployment does **not** pre-configure exec approvals, so OpenClaw's built-in defaults apply.
+
+> **Recommendation:** For production environments, configure exec approvals to control which commands the agent can run without user confirmation. This is especially important when node hosts have access to sensitive systems.
 
 #### Settings Reference
 
@@ -275,23 +277,33 @@ OpenClaw has a two-layer exec approval system — both the **gateway** and each 
 | `askFallback` | `"full"` | If approval prompt times out, auto-approve |
 | `askFallback` | `"deny"` | If approval prompt times out, deny |
 
-#### Changing Approval Behavior
+#### Configuring Approval Behavior
 
-**Via CLI on a node host:**
+**Via CLI (gateway pod):**
 
 ```bash
+kubectl exec -n openclaw deploy/openclaw-brain-alice -- \
+  openclaw config set tools.exec.security full
+
+kubectl exec -n openclaw deploy/openclaw-brain-alice -- \
+  openclaw config set tools.exec.ask off
+```
+
+**Via CLI (on a node host VM):**
+
+```bash
+# Auto-approve all commands
+openclaw config set tools.exec.security full
+openclaw config set tools.exec.ask off
+
 # Require approval for every command
 openclaw config set tools.exec.ask always
 
 # Restrict to allowlisted commands only
 openclaw config set tools.exec.security allowlist
-
-# Restore auto-approve
-openclaw config set tools.exec.security full
-openclaw config set tools.exec.ask off
 ```
 
-**Via `exec-approvals.json`** (applied at startup by the entrypoint/startup scripts):
+**Via `exec-approvals.json`** (place in the OpenClaw state directory):
 
 ```json
 {
@@ -310,9 +322,9 @@ openclaw config set tools.exec.ask off
 }
 ```
 
-You can also configure per-agent policies under the `agents` key to apply different approval rules for specific agents.
+Then apply: `openclaw approvals set /path/to/exec-approvals.json`
 
-> **Note:** Changes via CLI are ephemeral — the startup scripts re-apply `exec-approvals.json` on every restart. To make permanent changes, modify the approval config in the startup scripts (`scripts/entrypoint.sh`, `scripts/linux_startup.sh`, `scripts/windows_startup.ps1`).
+You can also configure per-agent policies under the `agents` key to apply different approval rules for specific agents.
 
 ---
 
@@ -840,26 +852,8 @@ npm install -g openclaw@latest --ignore-scripts
 New-Item -ItemType Directory -Path "C:\openclaw\state" -Force
 New-Item -ItemType Directory -Path "C:\openclaw\nodes" -Force
 
-# Configure exec approvals
-$execApprovals = @"
-{
-  "version": 1,
-  "defaults": {
-    "security": "full",
-    "ask": "off",
-    "askFallback": "full"
-  }
-}
-"@
-$execApprovals | Set-Content -Path "C:\openclaw\state\exec-approvals.json" -Encoding UTF8
-
 # Set environment variable
 [Environment]::SetEnvironmentVariable("OPENCLAW_STATE_DIR", "C:\openclaw\state", "Machine")
-
-# Run Sysprep preparation
-& "C:\Program Files\nodejs\npx.cmd" openclaw approvals set "C:\openclaw\state\exec-approvals.json"
-& "C:\Program Files\nodejs\npx.cmd" openclaw config set tools.exec.security full
-& "C:\Program Files\nodejs\npx.cmd" openclaw config set tools.exec.ask off
 
 # Clean up temp files
 Remove-Item C:\Windows\Temp\node-installer.msi -Force -ErrorAction SilentlyContinue
@@ -883,7 +877,7 @@ gcloud compute images create openclaw-windows-golden-v1 \
   --family=openclaw-windows \
   --storage-location=asia-southeast1 \
   --labels=app=openclaw,managed-by=terraform \
-  --description="OpenClaw Windows golden image with Node.js 22, OpenClaw, exec approvals pre-configured"
+  --description="OpenClaw Windows golden image with Node.js 22 and OpenClaw pre-installed"
 ```
 
 ### Step 4: Clean Up the Builder VM
