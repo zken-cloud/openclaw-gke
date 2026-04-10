@@ -147,6 +147,12 @@ foreach ($devName in $developers.PSObject.Properties.Name) {
         New-Item -ItemType Directory -Path $scriptDir -Force | Out-Null
     }
 
+    # Create log directory for Ops Agent to pick up
+    $logDir = "C:\openclaw\logs"
+    if (-not (Test-Path $logDir)) {
+        New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+    }
+
     $scriptPath = Join-Path $scriptDir "$devName-node.ps1"
     @"
 # OpenClaw node host for developer: $devName
@@ -184,10 +190,13 @@ if (`$LASTEXITCODE -eq 0) {
     Write-Output "WARNING: Could not refresh token, using cached value"
     `$env:OPENCLAW_GATEWAY_TOKEN = [Environment]::GetEnvironmentVariable("OPENCLAW_GATEWAY_TOKEN", "Machine")
 }
+`$logFile = "C:\openclaw\logs\$devName-node.log"
 while (`$true) {
-    Write-Output "Starting openclaw node host for $devName (gateway: $${gatewayIp}:18789, TLS)..."
-    & "C:\Program Files\nodejs\npx.cmd" openclaw node run --host $gatewayIp --port 18789 --tls --tls-fingerprint $tlsFingerprint --display-name "windows-$devName"
-    Write-Output "Node host exited, restarting in 10 seconds..."
+    `$ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    "`$ts Starting openclaw node host for $devName (gateway: $${gatewayIp}:18789, TLS)..." | Tee-Object -FilePath `$logFile -Append
+    & "C:\Program Files\nodejs\npx.cmd" openclaw node run --host $gatewayIp --port 18789 --tls --tls-fingerprint $tlsFingerprint --display-name "windows-$devName" 2>&1 | Tee-Object -FilePath `$logFile -Append
+    `$ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    "`$ts Node host exited, restarting in 10 seconds..." | Tee-Object -FilePath `$logFile -Append
     Start-Sleep -Seconds 10
 }
 "@ | Set-Content -Path $scriptPath -Encoding UTF8
@@ -223,6 +232,54 @@ while (`$true) {
     # Start immediately
     Start-ScheduledTask -TaskName $taskName
     Write-Output "Node host started for $devName (task: $taskName)"
+}
+
+# ── Install Google Cloud Ops Agent for log shipping ────────────────────────
+
+$opsAgentService = Get-Service -Name "google-cloud-ops-agent" -ErrorAction SilentlyContinue
+if (-not $opsAgentService) {
+    Write-Output "Installing Google Cloud Ops Agent..."
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $opsAgentInstaller = "C:\Windows\Temp\ops-agent-installer.ps1"
+    Invoke-WebRequest -Uri "https://dl.google.com/cloudagents/add-google-cloud-ops-agent-repo.ps1" -OutFile $opsAgentInstaller -UseBasicParsing
+    & powershell.exe -ExecutionPolicy Bypass -File $opsAgentInstaller -AlsoInstall
+
+    # Configure Ops Agent to collect openclaw scheduled task logs from Windows Event Log
+    $opsAgentConfig = @"
+logging:
+  receivers:
+    openclaw_events:
+      type: windows_event_log
+      channels:
+        - Application
+        - System
+      receiver_version: 2
+    openclaw_task_logs:
+      type: files
+      include_paths:
+        - C:\openclaw\logs\*.log
+  service:
+    pipelines:
+      openclaw_pipeline:
+        receivers:
+          - openclaw_events
+          - openclaw_task_logs
+metrics:
+  receivers:
+    hostmetrics:
+      type: hostmetrics
+      collection_interval: 60s
+  service:
+    pipelines:
+      default_pipeline:
+        receivers:
+          - hostmetrics
+"@
+    $opsAgentConfig | Set-Content -Path "C:\Program Files\Google\Cloud Operations\Ops Agent\config\config.yaml" -Encoding UTF8
+    Restart-Service -Name "google-cloud-ops-agent" -Force
+    Write-Output "Ops Agent installed and configured."
+} else {
+    Write-Output "Ops Agent already running."
 }
 
 Write-Output "OpenClaw Windows node host setup complete."

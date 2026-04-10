@@ -157,4 +157,43 @@ EOFSVC
     echo "Node host started for $DEV_NAME (service: $SERVICE_NAME)"
 done
 
+# ── Install Google Cloud Ops Agent for log shipping ────────────────────────
+
+if ! systemctl is-active --quiet google-cloud-ops-agent 2>/dev/null; then
+    echo "Installing Google Cloud Ops Agent..."
+    curl -sSO https://dl.google.com/cloudagents/add-google-cloud-ops-agent-repo.sh
+    bash add-google-cloud-ops-agent-repo.sh --also-install
+    rm -f add-google-cloud-ops-agent-repo.sh
+
+    # Configure Ops Agent to collect openclaw node host logs from journald
+    cat > /etc/google-cloud-ops-agent/config.yaml << 'EOFOPS'
+logging:
+  receivers:
+    openclaw_journal:
+      type: systemd_journal
+      units:
+        - openclaw-node-*
+  service:
+    pipelines:
+      openclaw_pipeline:
+        receivers:
+          - openclaw_journal
+metrics:
+  receivers:
+    hostmetrics:
+      type: hostmetrics
+      collection_interval: 60s
+  service:
+    pipelines:
+      default_pipeline:
+        receivers:
+          - hostmetrics
+EOFOPS
+
+    systemctl restart google-cloud-ops-agent
+    echo "Ops Agent installed and configured."
+else
+    echo "Ops Agent already running."
+fi
+
 echo "OpenClaw Linux node host setup complete."

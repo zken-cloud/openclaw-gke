@@ -166,6 +166,16 @@ variable "deployer_service_account" {
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Monitoring & Alerting
+# ──────────────────────────────────────────────────────────────────────────────
+
+variable "alert_email" {
+  description = "Email address for OpenClaw operational alerts (exec denied, node disconnects, crash loops)."
+  type        = string
+  default     = ""
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Labels
 # ──────────────────────────────────────────────────────────────────────────────
 
