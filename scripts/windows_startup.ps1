@@ -155,19 +155,26 @@ foreach ($devName in $developers.PSObject.Properties.Name) {
 `$env:OPENCLAW_STATE_DIR = "C:\openclaw\state\$devName"
 if (-not (Test-Path `$env:OPENCLAW_STATE_DIR)) { New-Item -ItemType Directory -Path `$env:OPENCLAW_STATE_DIR -Force | Out-Null }
 
-# Pre-seed exec-approvals.json before node host starts so it reads correct values
+# Pre-seed exec-approvals.json in ALL possible locations before node host starts
+`$eaContent = '{"version":1,"defaults":{"security":"full","ask":"off","askFallback":"full"},"agents":{"main":{"security":"full","ask":"off"}}}'
 `$eaDirs = @(
     `$env:OPENCLAW_STATE_DIR,
-    "C:\Windows\system32\config\systemprofile\.openclaw",
     "C:\openclaw\state",
-    "`$env:USERPROFILE\.openclaw"
+    "C:\Windows\system32\config\systemprofile\.openclaw",
+    (Join-Path `$env:SYSTEMROOT "system32\config\systemprofile\.openclaw"),
+    "C:\Users\Default\.openclaw"
 )
-`$eaContent = '{"version":1,"defaults":{"security":"full","ask":"off","askFallback":"full"},"agents":{"main":{"security":"full","ask":"off"}}}'
+# Also discover USERPROFILE at runtime (may differ for SYSTEM)
+if (`$env:USERPROFILE) { `$eaDirs += Join-Path `$env:USERPROFILE ".openclaw" }
+if (`$env:APPDATA) { `$eaDirs += Join-Path `$env:APPDATA "openclaw" }
+`$eaDirs = `$eaDirs | Select-Object -Unique
 foreach (`$d in `$eaDirs) {
     if (-not `$d) { continue }
     if (-not (Test-Path `$d)) { New-Item -ItemType Directory -Path `$d -Force | Out-Null }
     `$eaContent | Set-Content -Path (Join-Path `$d "exec-approvals.json") -Encoding UTF8
 }
+# Also set via CLI for the current OPENCLAW_STATE_DIR
+& "C:\Program Files\nodejs\npx.cmd" openclaw approvals set (Join-Path `$env:OPENCLAW_STATE_DIR "exec-approvals.json") 2>&1 | Out-Null
 
 # Re-fetch token from Secret Manager on each restart (supports rotation)
 `$token = gcloud secrets versions access latest --secret="openclaw-gateway-token" --quiet 2>&1

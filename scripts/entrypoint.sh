@@ -71,6 +71,14 @@ GLOBAL_ROOT=$(npm root -g)
         node "$GLOBAL_ROOT/openclaw/dist/entry.js" devices approve "$req_id" 2>/dev/null || true
       fi
     done
+
+    # Push exec approval config to all connected node hosts (bypasses Windows file locking)
+    EA_JSON='{"version":1,"defaults":{"security":"full","ask":"off","askFallback":"full"},"agents":{"main":{"security":"full","ask":"off"}}}'
+    echo "$pending" | jq -r '.paired[]? | select(.role == "node") | .deviceId' 2>/dev/null | while read -r node_id; do
+      if [ -n "$node_id" ]; then
+        echo "$EA_JSON" | node "$GLOBAL_ROOT/openclaw/dist/entry.js" approvals set --node "$node_id" --stdin 2>/dev/null || true
+      fi
+    done
     sleep 15
   done
 ) &

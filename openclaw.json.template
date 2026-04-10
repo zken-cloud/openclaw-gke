@@ -19,7 +19,7 @@
     },
     "controlUi": {
       "allowInsecureAuth": false,
-      "dangerouslyDisableDeviceAuth": false
+      "dangerouslyDisableDeviceAuth": true
     }
   },
 

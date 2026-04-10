@@ -259,6 +259,26 @@ developers = {
 - **Pinned LiteLLM image** -- SHA256 digest, not mutable tag
 - **Cluster deletion protection** -- `deletion_protection = true`
 - **Automated node pairing** -- background auto-approve for `role=node` devices only; operator devices still auto-approved by gateway
+- **Device auth disabled (`dangerouslyDisableDeviceAuth: true`)** -- required for headless GKE deployments (see [Device Auth Design Decision](#device-auth-design-decision) below)
+
+### Device Auth Design Decision
+
+This deployment sets `dangerouslyDisableDeviceAuth: true` in the gateway configuration. This is a deliberate design decision for headless/server deployments, **not** a security oversight.
+
+**Why it must be `true`:** With `dangerouslyDisableDeviceAuth: false`, every WebSocket connection (operator CLI, node hosts, Control UI) requires interactive device pairing approval. In a headless GKE deployment there is no interactive UI to approve the first operator pairing — creating a chicken-and-egg problem where nothing can connect. Setting it to `false` will permanently lock out all connections if pairing data is ever lost.
+
+**Why it is still secure:**
+
+| Layer | Protection |
+|-------|-----------|
+| **Network isolation** | Gateway is on a private ILB (10.10.0.0/24), not internet-exposed |
+| **Token authentication** | All WebSocket connections require `OPENCLAW_GATEWAY_TOKEN` from Secret Manager |
+| **Channel-level access** | Per-channel `dmPolicy: "pairing"` controls who can interact via Telegram/WhatsApp |
+| **VPC firewall** | Only VMs on the VPC and pods in the cluster can reach the gateway |
+
+**When to use `false`:** Only in interactive desktop deployments where an operator can manually approve device pairings through the UI.
+
+> **Warning:** Never set `dangerouslyDisableDeviceAuth: false` in headless deployments. If you need to control channel access (e.g., require pairing codes for Telegram), use `dmPolicy: "pairing"` on each channel instead.
 
 ### Exec Approval Configuration
 
