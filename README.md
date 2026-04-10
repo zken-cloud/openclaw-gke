@@ -14,6 +14,11 @@ Terraform-managed infrastructure for deploying OpenClaw on Google Cloud Platform
   - [Troubleshooting](#troubleshooting)
 - [Channel Configuration](#channel-configuration)
 - [Windows VM Golden Image](#windows-vm-golden-image)
+- [Observability](#observability)
+  - [Log Collection](#log-collection)
+  - [Log Storage](#log-storage)
+  - [Alerting](#alerting)
+  - [Dashboard](#dashboard)
 - [Variables Reference](#variables-reference)
 - [Outputs Reference](#outputs-reference)
 
@@ -45,8 +50,17 @@ graph TD
         NAT["Cloud NAT<br/>Outbound Only"]
         VERTEX["Vertex AI<br/>Gemini 3.1 Pro / Flash"]
 
+        subgraph OBS["Observability"]
+            CL["Cloud Logging"]
+            CM["Cloud Monitoring<br/>Alerts + Dashboard"]
+            GCS["GCS Bucket<br/>Long-term Log Storage"]
+        end
+
         SM --> GKE
         LITELLM -->|Workload Identity<br/>No API Keys| VERTEX
+        GKE -->|stdout/stderr| CL
+        CL -->|Log Sink| GCS
+        CL --> CM
     end
 ```
 
@@ -69,10 +83,11 @@ graph TD
             BOB_POD --> LITELLM
         end
 
-        subgraph VM["Execution VM<br/>(Windows or Linux, Shielded, No Public IP)"]
+        subgraph VM["Execution VMs<br/>(Windows + Linux, Shielded, No Public IP)"]
             direction TB
             NH_ALICE["Node Host: alice"]
             NH_BOB["Node Host: bob"]
+            OPS_AGENT["Ops Agent<br/>journald / Event Log"]
         end
 
         SM["Secret Manager<br/>gateway-token / brave-key"]
@@ -80,9 +95,19 @@ graph TD
         NAT["Cloud NAT<br/>Outbound Only"]
         VERTEX["Vertex AI<br/>Gemini 3.1 Pro / Flash"]
 
+        subgraph OBS["Observability"]
+            CL["Cloud Logging"]
+            CM["Cloud Monitoring<br/>Alerts + Dashboard"]
+            GCS["GCS Bucket<br/>Long-term Log Storage"]
+        end
+
         SM --> GKE
         SM --> VM
         LITELLM -->|Workload Identity<br/>No API Keys| VERTEX
+        GKE -->|stdout/stderr| CL
+        OPS_AGENT -->|Node host logs| CL
+        CL -->|Log Sink| GCS
+        CL --> CM
     end
 
     ALICE_POD <-->|"ILB (TLS :18789)"| NH_ALICE
@@ -101,6 +126,10 @@ graph TD
 | **Secret Manager** | Stores gateway auth token, Brave API key | GCP managed service |
 | **Artifact Registry** | Private Docker registry for OpenClaw container images | GCP managed service |
 | **Cloud NAT** | Outbound internet for pods and VMs (no public IPs on any resource) | GCP managed service |
+| **Cloud Logging** | Centralized log collection from pods (stdout) and VMs (Ops Agent) | GCP managed service |
+| **Cloud Monitoring** | Alert policies and operations dashboard for OpenClaw components | GCP managed service |
+| **GCS Log Bucket** | Long-term log storage with lifecycle policies (Standard → Nearline → Coldline) | GCS bucket |
+| **Ops Agent** *(on VMs)* | Ships journald (Linux) and Event Log / file logs (Windows) to Cloud Logging | Google Cloud Ops Agent |
 
 ---
 
@@ -950,6 +979,112 @@ gcloud scheduler jobs create http openclaw-golden-image-rebuild \
 
 ---
 
+## Observability
+
+All OpenClaw logs from pods and VMs are collected, stored, and monitored through a unified observability stack managed entirely by Terraform.
+
+```mermaid
+graph LR
+    subgraph Sources
+        POD["Gateway Pods<br/>stdout/stderr"]
+        LINUX_VM["Linux VM<br/>journald"]
+        WIN_VM["Windows VM<br/>Event Log + File Logs"]
+    end
+
+    subgraph Collection
+        GKE_LOG["GKE Auto-shipping"]
+        OPS_LINUX["Ops Agent<br/>(systemd_journal)"]
+        OPS_WIN["Ops Agent<br/>(windows_event_log + files)"]
+    end
+
+    subgraph Storage
+        CL["Cloud Logging<br/>(30-day retention)"]
+        GCS["GCS Bucket<br/>(90d Standard → Nearline<br/>365d → Coldline)"]
+    end
+
+    subgraph Monitoring
+        METRICS["Log-Based Metrics"]
+        ALERTS["Alert Policies<br/>(Email)"]
+        DASH["Operations Dashboard"]
+    end
+
+    POD --> GKE_LOG --> CL
+    LINUX_VM --> OPS_LINUX --> CL
+    WIN_VM --> OPS_WIN --> CL
+    CL -->|Log Sink| GCS
+    CL --> METRICS --> ALERTS
+    METRICS --> DASH
+```
+
+### Log Collection
+
+| Source | Mechanism | What's Collected |
+|--------|-----------|-----------------|
+| **Gateway pods** | GKE auto-ships stdout/stderr to Cloud Logging | Gateway startup, WebSocket activity, pairing, exec results, errors |
+| **Linux VM** | Ops Agent (`systemd_journal` receiver, `openclaw-node-*` units) | Node host connect/disconnect, exec output, restart events |
+| **Windows VM** | Ops Agent (`windows_event_log` + `files` receiver for `C:\openclaw\logs\*.log`) | Node host output, scheduled task events, errors |
+
+Ops Agent is installed automatically by the VM startup scripts on first boot. It also collects host-level metrics (CPU, memory, disk) at 60-second intervals.
+
+### Log Storage
+
+Logs flow through two tiers:
+
+| Tier | Retention | Use Case |
+|------|-----------|----------|
+| **Cloud Logging** | 30 days (default) | Real-time querying, tailing, dashboard panels |
+| **GCS Bucket** (`{project_id}-openclaw-logs`) | Unlimited | Long-term retention, compliance, post-incident analysis |
+
+The GCS bucket uses lifecycle policies to reduce cost:
+- **0–90 days**: Standard storage (frequent access for debugging)
+- **90–365 days**: Nearline storage (occasional access)
+- **365+ days**: Coldline storage (rare access, compliance retention)
+
+The log sink exports all logs matching:
+```
+(resource.type="k8s_container" AND resource.labels.namespace_name="openclaw")
+OR
+(resource.type="gce_instance" AND resource.labels.instance_id=~"openclaw-exec-.*")
+```
+
+### Alerting
+
+Four alert policies notify via email when operational issues are detected. Alerts are only created when `alert_email` is set in `terraform.tfvars`.
+
+| Alert | Trigger | Threshold | Meaning |
+|-------|---------|-----------|---------|
+| **Exec Approval Denied** | `SYSTEM_RUN_DENIED` in pod logs | Any occurrence | A node host denied a command -- exec-approvals.json has wrong defaults or the auto-push loop failed |
+| **Node Host Disconnected** | `NOT_CONNECTED: node not connected` | >50 in 5 minutes | Stale paired node entries or a VM is down |
+| **Gateway CrashLoop** | `CrashLoopBackOff` in pod logs | Any occurrence | Bad config, missing secrets, or throwOnLoadError crash |
+| **VM Node Host Failure** | `Node host exited` or `ERROR` in VM logs | >5 in 5 minutes | Node host process repeatedly crashing on a VM |
+
+Each alert includes runbook-style documentation with common causes and remediation steps.
+
+To enable alerts:
+
+```hcl
+# In terraform.tfvars
+alert_email = "your-team@example.com"
+```
+
+### Dashboard
+
+The **"OpenClaw Operations"** dashboard in Cloud Monitoring provides a single-pane view of the entire system:
+
+| Panel | Type | Shows |
+|-------|------|-------|
+| **Gateway Pod Logs** | Log panel | All gateway pod logs (all developers) |
+| **Execution VM Logs** | Log panel | All VM logs (Linux + Windows) |
+| **Exec Denied Events** | Time-series chart | `SYSTEM_RUN_DENIED` events over time |
+| **Node Disconnection Errors** | Time-series chart | `NOT_CONNECTED` errors over time |
+| **VM Node Host Failures** | Time-series chart | VM node host errors over time |
+| **Gateway Errors Only** | Log panel | Severity >= ERROR from gateway pods |
+| **WebSocket Activity** | Log panel | All `[ws]` WebSocket request/response logs |
+
+Access the dashboard at: **Cloud Console → Monitoring → Dashboards → OpenClaw Operations**
+
+---
+
 ## Variables Reference
 
 | Variable | Required | Default | Description |
@@ -978,6 +1113,9 @@ gcloud scheduler jobs create http openclaw-golden-image-rebuild \
 | `model_fallbacks` | No | `["litellm/gemini-3.1-flash-lite-preview"]` | Fallback models (JSON array) |
 | `developers` | No | `{"default" = {active = true}}` | Map of developer names to config |
 | `deployer_service_account` | No | `""` | SA email for IAP tunnel access |
+| **Monitoring** | | | |
+| `alert_email` | No | `""` | Email for operational alerts (exec denied, disconnects, crashes) |
+| **Labels** | | | |
 | `labels` | No | `{app="openclaw",...}` | Resource labels |
 
 ## Outputs Reference
