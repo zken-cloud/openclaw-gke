@@ -1,66 +1,97 @@
-# OpenClaw on GCP -- Multi-Tenant GKE Deployment with Optional Execution VM
+# OpenClaw on GCP — Multi-Tenant GKE with Kata Containers
 
-Terraform-managed infrastructure for deploying OpenClaw on Google Cloud Platform. The default deployment runs OpenClaw brain pods on a GKE Standard cluster with Kata Containers (VM-level isolation). Optionally, you can add an execution VM (Windows or Linux) for OS-native command execution via node hosts.
+Deploy [OpenClaw](https://docs.openclaw.ai) on Google Cloud with GKE Standard, Kata Containers (VM-level isolation), and Vertex AI — fully managed by Terraform. Optionally add execution VMs (Windows/Linux) for OS-native command execution.
+
+---
 
 ## Table of Contents
 
 - [Architecture](#architecture)
-- [Execution VM (Optional)](#execution-vm-optional)
-- [Multi-Tenant Design](#multi-tenant-design)
 - [Security Features](#security-features)
 - [Deployment Guide](#deployment-guide)
 - [End-to-End Testing](#end-to-end-testing)
-  - [Connecting to the GKE Cluster](#connecting-to-the-gke-cluster)
-  - [Troubleshooting](#troubleshooting)
-- [Channel Configuration](#channel-configuration)
+- [Adding Messaging Channels](#adding-messaging-channels)
+  - [Telegram](#telegram)
+  - [WhatsApp](#whatsapp)
+  - [Slack](#slack)
+- [Execution VM (Optional)](#execution-vm-optional)
 - [Windows VM Golden Image](#windows-vm-golden-image)
 - [Observability](#observability)
-  - [Log Collection](#log-collection)
-  - [Log Storage](#log-storage)
-  - [Alerting](#alerting)
-  - [Dashboard](#dashboard)
 - [Variables Reference](#variables-reference)
 - [Outputs Reference](#outputs-reference)
+- [File Structure](#file-structure)
+- [Cleanup](#cleanup)
 
 ---
 
 ## Architecture
 
+[Back to top](#table-of-contents)
+
 ### Default: GKE-Only (no execution VM)
 
 ```mermaid
 graph TD
-    DEV["Developer Laptop<br/>gcloud / kubectl / TUI"]
-    DEV -->|IAP TCP Tunnel| GCP
+    Dev["Developer (kubectl / TUI)"]
 
-    subgraph GCP["GCP Project (Private VPC)"]
-        direction TB
+    Dev -->|"IAP TCP Tunnel"| GKE
 
-        subgraph GKE["GKE Standard Cluster (Private)"]
-            direction TB
-            ALICE_POD["openclaw-brain-alice<br/>Pod (Kata VM)"]
-            BOB_POD["openclaw-brain-bob<br/>Pod (Kata VM)"]
-            LITELLM["LiteLLM Proxy<br/>Pod (Kata VM)"]
-            ALICE_POD --> LITELLM
-            BOB_POD --> LITELLM
+    subgraph GCP["GCP Project"]
+
+        subgraph GKE["GKE Standard — all pods sandboxed by Kata Containers"]
+            subgraph NS["Namespace: openclaw"]
+
+                subgraph PodA["Pod: openclaw-brain-alice"]
+                    direction LR
+                    GA["OpenClaw Gateway\n(:18789)"]
+                end
+
+                subgraph PodB["Pod: openclaw-brain-bob"]
+                    direction LR
+                    GB["OpenClaw Gateway\n(:18789)"]
+                end
+
+                LITELLM["LiteLLM Proxy\n(:4000)"]
+
+                PodA -.-|"mount"| PVCA["PVC alice (10Gi)"]
+                PodB -.-|"mount"| PVCB["PVC bob (10Gi)"]
+
+                GA -->|"localhost:4000"| LITELLM
+                GB -->|"localhost:4000"| LITELLM
+
+                KSA["K8s SA: openclaw-brain"]
+                PodA -.- KSA
+                PodB -.- KSA
+            end
         end
 
-        SM["Secret Manager<br/>gateway-token / brave-key"]
-        AR["Artifact Registry<br/>Docker Images"]
-        NAT["Cloud NAT<br/>Outbound Only"]
-        VERTEX["Vertex AI<br/>Gemini 3.1 Pro / Flash"]
+        KSA -->|"Workload Identity"| GSA["GCP SA: openclaw-brain@"]
+        GSA -->|"roles/aiplatform.user"| Vertex["Vertex AI\nGemini Models"]
+        LITELLM -->|"Workload Identity\nNo API Keys"| Vertex
 
-        subgraph OBS["Observability"]
-            CL["Cloud Logging"]
-            CM["Cloud Monitoring<br/>Alerts + Dashboard"]
-            GCS["GCS Bucket<br/>Long-term Log Storage"]
+        SM["Secret Manager\n(gateway-token, brave-key)"]
+        SM -.-|"mount as env"| NS
+
+        subgraph Ops["Operations"]
+            direction LR
+            Logging["Cloud Logging"]
+            GCS["GCS Log Bucket"]
+            Mon["Monitoring\nDashboard + Alerts"]
+            Logging --> GCS
+            Logging --> Mon
         end
 
-        SM --> GKE
-        LITELLM -->|Workload Identity<br/>No API Keys| VERTEX
-        GKE -->|stdout/stderr| CL
-        CL -->|Log Sink| GCS
-        CL --> CM
+        GKE -->|"pod logs"| Logging
+
+        AR["Artifact Registry"] -->|"pull image"| GKE
+
+        subgraph Net["VPC Network"]
+            direction LR
+            NAT["Cloud NAT\n(outbound only)"]
+            FW["Deny-all ingress\n+ IAP SSH only"]
+        end
+
+        GKE --- Net
     end
 ```
 
@@ -68,91 +99,635 @@ graph TD
 
 ```mermaid
 graph TD
-    DEV["Developer Laptop<br/>gcloud / kubectl / TUI"]
-    DEV -->|IAP TCP Tunnel| GCP
+    Dev["Developer (kubectl / TUI)"]
 
-    subgraph GCP["GCP Project (Private VPC)"]
-        direction TB
+    Dev -->|"IAP TCP Tunnel"| GCP
 
-        subgraph GKE["GKE Standard Cluster (Private)"]
+    subgraph GCP["GCP Project"]
+
+        subgraph GKE["GKE Standard — Kata Containers"]
+            subgraph NS["Namespace: openclaw"]
+                PodA["Pod: openclaw-brain-alice\n(gateway :18789)"]
+                PodB["Pod: openclaw-brain-bob\n(gateway :18789)"]
+                LITELLM["LiteLLM Proxy\n(:4000)"]
+                PodA --> LITELLM
+                PodB --> LITELLM
+            end
+        end
+
+        subgraph VM["Execution VMs (Shielded, No Public IP)"]
             direction TB
-            ALICE_POD["openclaw-brain-alice<br/>Pod (Kata VM)"]
-            BOB_POD["openclaw-brain-bob<br/>Pod (Kata VM)"]
-            LITELLM["LiteLLM Proxy<br/>Pod (Kata VM)"]
-            ALICE_POD --> LITELLM
-            BOB_POD --> LITELLM
+            NH_A["Node Host: alice"]
+            NH_B["Node Host: bob"]
+            OPS["Ops Agent\n(journald / Event Log)"]
         end
 
-        subgraph VM["Execution VMs<br/>(Windows + Linux, Shielded, No Public IP)"]
-            direction TB
-            NH_ALICE["Node Host: alice"]
-            NH_BOB["Node Host: bob"]
-            OPS_AGENT["Ops Agent<br/>journald / Event Log"]
-        end
+        PodA <-->|"ILB (TLS :18789)"| NH_A
+        PodB <-->|"ILB (TLS :18789)"| NH_B
 
-        SM["Secret Manager<br/>gateway-token / brave-key"]
-        AR["Artifact Registry<br/>Docker Images"]
-        NAT["Cloud NAT<br/>Outbound Only"]
-        VERTEX["Vertex AI<br/>Gemini 3.1 Pro / Flash"]
+        LITELLM -->|"Workload Identity"| Vertex["Vertex AI\nGemini Models"]
 
-        subgraph OBS["Observability"]
-            CL["Cloud Logging"]
-            CM["Cloud Monitoring<br/>Alerts + Dashboard"]
-            GCS["GCS Bucket<br/>Long-term Log Storage"]
-        end
-
-        SM --> GKE
+        SM["Secret Manager"] --> GKE
         SM --> VM
-        LITELLM -->|Workload Identity<br/>No API Keys| VERTEX
-        GKE -->|stdout/stderr| CL
-        OPS_AGENT -->|Node host logs| CL
-        CL -->|Log Sink| GCS
-        CL --> CM
-    end
 
-    ALICE_POD <-->|"ILB (TLS :18789)"| NH_ALICE
-    BOB_POD <-->|"ILB (TLS :18789)"| NH_BOB
+        subgraph Ops["Operations"]
+            direction LR
+            Logging["Cloud Logging"]
+            GCS["GCS Log Bucket"]
+            Mon["Dashboard + Alerts"]
+            Logging --> GCS
+            Logging --> Mon
+        end
+
+        GKE -->|"stdout/stderr"| Logging
+        OPS -->|"node host logs"| Logging
+
+        subgraph Net["VPC Network"]
+            NAT["Cloud NAT"]
+            FW["Firewall Rules"]
+        end
+
+        GKE --- Net
+        VM --- Net
+    end
 ```
 
-### Component Summary
+### Component Overview
 
-| Component | Purpose | Runtime |
-|-----------|---------|---------|
-| **OpenClaw Brain Pods** | AI agent gateway -- receives user messages, plans actions, dispatches to tools | GKE + Kata Containers (VM-level isolation) |
-| **LiteLLM Proxy** | Routes LLM requests to Vertex AI Gemini models via Workload Identity (no API keys) | GKE + Kata Containers |
-| **Execution VM** *(optional)* | Executes OS-native commands dispatched by agents (Windows: PowerShell/CMD, Linux: bash) | GCE, Shielded VM, no public IP |
-| **Node Hosts** *(optional)* | Per-developer `openclaw node run` processes on the execution VM, connecting back to gateway pods over TLS WebSocket | Windows: Scheduled Tasks, Linux: systemd services |
-| **Internal Load Balancers** *(optional)* | Per-developer ILBs allowing VM node hosts to reach gateway pods inside GKE | GKE Service (type: LoadBalancer, internal) |
-| **Secret Manager** | Stores gateway auth token, Brave API key | GCP managed service |
-| **Artifact Registry** | Private Docker registry for OpenClaw container images | GCP managed service |
-| **Cloud NAT** | Outbound internet for pods and VMs (no public IPs on any resource) | GCP managed service |
-| **Cloud Logging** | Centralized log collection from pods (stdout) and VMs (Ops Agent) | GCP managed service |
-| **Cloud Monitoring** | Alert policies and operations dashboard for OpenClaw components | GCP managed service |
-| **GCS Log Bucket** | Long-term log storage with lifecycle policies (Standard → Nearline → Coldline) | GCS bucket |
-| **Ops Agent** *(on VMs)* | Ships journald (Linux) and Event Log / file logs (Windows) to Cloud Logging | Google Cloud Ops Agent |
+| Component | Purpose |
+|-----------|---------|
+| **GKE Standard + Kata** | Managed Kubernetes with VM-level isolation via Kata Containers (nested virtualization on N2 nodes) |
+| **LiteLLM Proxy** | Routes LLM requests to Vertex AI Gemini models via Workload Identity — no API keys |
+| **Workload Identity** | Maps K8s ServiceAccount to GCP SA — no service account keys stored anywhere |
+| **Per-Developer Pods** | Each developer gets an isolated pod + PVC with their own OpenClaw gateway instance |
+| **Execution VM** *(optional)* | Windows or Linux VM for OS-native command execution (PowerShell, CMD, bash) |
+| **Node Hosts** *(optional)* | Per-developer `openclaw node run` processes on VMs, connecting to gateway pods over TLS WebSocket |
+| **Internal Load Balancers** *(optional)* | Per-developer ILBs for VM-to-GKE connectivity |
+| **Cloud Monitoring** | Dashboard with 7 tiles, alert policies for crashes, disconnections, and exec denials |
+| **Cloud Logging** | Logs routed to GCS with lifecycle policies (90d Nearline, 365d Coldline) |
+
+[Back to top](#table-of-contents)
+
+---
+
+## Security Features
+
+[Back to top](#table-of-contents)
+
+### Kata Containers — VM-Level Sandboxing
+
+Every OpenClaw pod runs inside a [Kata Container](https://katacontainers.io/) providing full VM isolation. Kata spins up a lightweight VM per pod using nested virtualization on N2 nodes:
+
+- **Full kernel isolation** — Each pod gets its own guest kernel. Even if OpenClaw executes malicious code, it cannot reach the host kernel.
+- **Stronger than gVisor** — Unlike syscall-filtering approaches, Kata provides a hardware-enforced VM boundary via KVM/QEMU.
+- **Explicit opt-in** — Pods use `runtimeClassName: kata-clh`, configured by Terraform. No accidental fallback to the default runtime.
+
+### Zero API Keys in the Cluster
+
+The authentication chain uses identity federation — no API key secrets exist:
+
+```
+Pod → K8s ServiceAccount → Workload Identity → GCP Service Account → Vertex AI
+```
+
+- LiteLLM uses Application Default Credentials via the metadata server.
+- Tokens are automatically refreshed — no key rotation needed.
+- The only secrets stored are the gateway auth token (auto-generated) and optional Brave API key.
+
+### Network Isolation
+
+| Control | Implementation |
+|---------|---------------|
+| Private GKE nodes | Nodes have no public IPs |
+| Cloud NAT | Outbound-only internet access for pulling images and calling Vertex AI |
+| Deny-all ingress firewall | Only IAP SSH (`35.235.240.0/20`) and VM-to-GKE (`:18789`) allowed |
+| Master authorized networks | Control plane restricted to GKE/VM subnets + explicitly listed CIDRs |
+| Per-developer PVC isolation | Each developer's data is on a separate PersistentVolumeClaim |
+| VPC flow logs | Enabled on GKE subnet with full metadata |
+
+### IAM Least Privilege
+
+| Service Account | Roles | Purpose |
+|----------------|-------|---------|
+| `openclaw-brain` | `aiplatform.user`, `logging.logWriter`, `monitoring.metricWriter` | Pod workload identity |
+| `openclaw-exec-vm` | `logging.logWriter`, `monitoring.metricWriter` | VM log/metric shipping |
+| Per-secret IAM | `secretmanager.secretAccessor` | Individual secret bindings, not project-wide |
+
+### Application Security
+
+| Layer | Protection |
+|-------|-----------|
+| **TLS + fingerprint pinning** | Self-signed ECDSA P256 cert, SHA256 fingerprint validated by node hosts |
+| **Token authentication** | All WebSocket connections require `OPENCLAW_GATEWAY_TOKEN` from Secret Manager |
+| **Non-root containers** | UID 10001, enforced by `runAsNonRoot: true` |
+| **Shielded VMs** | Secure Boot, vTPM, Integrity Monitoring on GKE nodes and execution VMs |
+| **Container scanning** | `containerscanning.googleapis.com` enabled on Artifact Registry |
+| **Pinned LiteLLM image** | SHA256 digest, not mutable tag |
+| **Cluster deletion protection** | `deletion_protection = true` |
+
+### Device Auth Design Decision
+
+This deployment sets `dangerouslyDisableDeviceAuth: true` — a deliberate choice for headless/server deployments, **not** a security oversight.
+
+**Why:** With device auth enabled, every WebSocket connection requires interactive pairing approval. In a headless GKE deployment there is no UI to approve the first operator pairing — creating a chicken-and-egg problem.
+
+**Why it is still secure:** The gateway sits on a private ILB (`10.10.0.0/24`), all connections require the gateway auth token from Secret Manager, and VPC firewall rules restrict access to pods and VMs on the VPC. For channel-level access control (e.g., Telegram), use `dmPolicy: "pairing"` on each channel.
+
+> **Warning:** Never set `dangerouslyDisableDeviceAuth: false` in headless deployments — it will permanently lock out all connections if pairing data is lost.
+
+[Back to top](#table-of-contents)
+
+---
+
+## Deployment Guide
+
+[Back to top](#table-of-contents)
+
+### Prerequisites
+
+- [Terraform](https://developer.hashicorp.com/terraform/install) >= 1.5
+- [gcloud CLI](https://cloud.google.com/sdk/docs/install) authenticated with a project owner account
+- [kubectl](https://kubernetes.io/docs/tasks/tools/) installed
+- A GCP project with billing enabled
+
+### Step 1: Create the State Bucket
+
+```bash
+export PROJECT_ID="my-gcp-project"
+
+# Create Terraform state bucket
+gsutil mb -p "$PROJECT_ID" -l asia-southeast1 "gs://${PROJECT_ID}-tf-state"
+gsutil versioning set on "gs://${PROJECT_ID}-tf-state"
+```
+
+[Back to top](#table-of-contents)
+
+### Step 2: Clone and Configure
+
+```bash
+git clone https://github.com/zken-cloud/openclaw-gke-kata.git
+cd openclaw-gke-kata
+```
+
+Edit `terraform.tfvars`:
+
+```hcl
+# Required
+project_id = "my-gcp-project"
+
+# Region
+region = "asia-southeast1"
+zone   = "asia-southeast1-a"
+
+# Models
+openclaw_version = "latest"
+model_primary    = "litellm/gemini-3.1-pro-preview"
+model_fallbacks  = "[\"litellm/gemini-3.1-flash-lite-preview\"]"
+
+# Developers — each gets a dedicated pod and 10Gi PVC
+developers = {
+  "alice" = { active = true }
+  "bob"   = { active = true }
+}
+
+# Control plane access (add your IP/CIDR)
+master_authorized_cidrs = {
+  "My IP" = "YOUR_IP/32"
+}
+
+# Optional: Execution VMs (uncomment to enable)
+# exec_vms = {
+#   "windows" = { os_image = "windows-cloud/windows-2022-core" }
+#   "linux"   = { os_image = "debian-cloud/debian-12" }
+# }
+
+# Alerts (optional)
+alert_email = "you@example.com"
+```
+
+Set sensitive variables via environment:
+
+```bash
+export TF_VAR_gateway_auth_token=""  # leave empty to auto-generate
+export TF_VAR_brave_api_key=""       # optional
+```
+
+[Back to top](#table-of-contents)
+
+### Step 3: Deploy
+
+```bash
+terraform init -backend-config="bucket=${PROJECT_ID}-tf-state"
+terraform plan
+terraform apply
+```
+
+This will:
+1. Enable all required GCP APIs
+2. Create VPC, subnet, Cloud NAT, firewall rules
+3. Create GKE Standard cluster with Kata-enabled node pool (N2, nested virtualization)
+4. Install Kata Containers via Helm
+5. Deploy per-developer OpenClaw pods, PVCs, and ILB services
+6. Deploy LiteLLM proxy with Workload Identity
+7. Create Secret Manager secrets and IAM bindings
+8. Set up monitoring dashboard, alert policies, and log sink
+9. *(If `exec_vms` is non-empty)* Create execution VMs, subnet, firewall, and node hosts
+
+Deployment takes approximately 15–20 minutes (GKE cluster creation is the bottleneck).
+
+[Back to top](#table-of-contents)
+
+### Step 4: Build and Push the Container Image
+
+> **Skip this step** if you set `sandbox_image` to a custom pre-built image in your `terraform.tfvars`.
+
+```bash
+export PROJECT_ID="my-gcp-project"
+export REGION="asia-southeast1"
+./scripts/build_and_push.sh
+```
+
+[Back to top](#table-of-contents)
+
+### Step 5: Restart Pods
+
+```bash
+kubectl rollout restart deployment -n openclaw -l component=brain
+```
+
+[Back to top](#table-of-contents)
+
+### Step 6: Verify
+
+```bash
+# Get cluster credentials
+gcloud container clusters get-credentials openclaw-cluster \
+  --region $(terraform output -raw gke_cluster_region 2>/dev/null || echo "asia-southeast1") \
+  --project $PROJECT_ID
+
+# Check pods are running
+kubectl get pods -n openclaw
+
+# Expected:
+# NAME                                    READY   STATUS    AGE
+# litellm-xxxxx                           1/1     Running   5m
+# openclaw-brain-alice-xxxxx              1/1     Running   5m
+# openclaw-brain-bob-xxxxx                1/1     Running   5m
+
+# Verify Kata runtime is active
+kubectl get pods -n openclaw -o jsonpath='{range .items[*]}{.metadata.name}{" -> "}{.spec.runtimeClassName}{"\n"}{end}'
+
+# Verify non-root
+kubectl exec -n openclaw deployment/openclaw-brain-alice -- id
+# Expected: uid=10001(openclaw) gid=10001(openclaw)
+```
+
+[Back to top](#table-of-contents)
+
+### Step 7: Verify Node Host Pairing (only if `exec_vms` is non-empty)
+
+Wait 3–5 minutes for the VM startup script to install OpenClaw, clean stale identity, and start node hosts. Pairing is fully automated:
+
+```bash
+# Check alice's node connection
+kubectl exec -n openclaw deployment/openclaw-brain-alice -- npx openclaw nodes status
+# Expected: Known: 1 · Paired: 1 · Connected: 1
+
+# Check bob
+kubectl exec -n openclaw deployment/openclaw-brain-bob -- npx openclaw nodes status
+```
+
+If nodes show "disconnected", check the gateway logs:
+
+```bash
+kubectl logs -n openclaw deployment/openclaw-brain-alice --tail=20 | grep -E "auto-pair|auto-approved|pairing"
+```
+
+[Back to top](#table-of-contents)
+
+---
+
+## End-to-End Testing
+
+[Back to top](#table-of-contents)
+
+Step-by-step guide to verify every feature after deployment.
+
+### Prerequisites
+
+```bash
+# Ensure you have cluster access
+gcloud container clusters get-credentials openclaw-cluster \
+  --region asia-southeast1 --project $PROJECT_ID
+
+# Verify pods are running
+kubectl get pods -n openclaw
+# Expected: openclaw-brain-alice, openclaw-brain-bob, and litellm in Running state
+```
+
+[Back to top](#table-of-contents)
+
+### Test 1: LiteLLM Proxy Health
+
+```bash
+kubectl exec -n openclaw deployment/litellm -- curl -s http://localhost:4000/health
+```
+
+Expected: `{"status":"ok"}`
+
+[Back to top](#table-of-contents)
+
+### Test 2: Kata Container Verification
+
+```bash
+# Verify runtime class exists
+kubectl get runtimeclass kata-clh
+
+# Verify pods use Kata
+kubectl get pods -n openclaw -o jsonpath='{range .items[*]}{.metadata.name}{" -> "}{.spec.runtimeClassName}{"\n"}{end}'
+
+# Verify kernel isolation (dmesg should be blocked)
+kubectl exec -n openclaw deployment/openclaw-brain-alice -- dmesg 2>&1 | head -5
+# Expected: "dmesg: read kernel buffer failed: Operation not permitted"
+```
+
+[Back to top](#table-of-contents)
+
+### Test 3: OpenClaw TUI (Interactive)
+
+```bash
+# Launch the TUI inside alice's pod
+kubectl exec -it -n openclaw deployment/openclaw-brain-alice -- npx openclaw tui
+```
+
+In the TUI:
+
+1. **Test basic conversation:**
+   ```
+   You: Hello, what model are you using?
+   ```
+   Verify the agent responds and identifies the Gemini model.
+
+2. **Test command execution** (requires execution VM):
+   ```
+   You: Run "hostname" on the Windows node host
+   ```
+   Approve the command when the approval box appears:
+   ```
+   ┌─ exec ──────────────────────────────
+   │ hostname
+   │ host: windows-alice
+   │ id: a1b2c3
+   │ ─────────────────────────────────
+   │ /approve a1b2c3 allow
+   └─────────────────────────────────────
+   ```
+   Type `/approve a1b2c3 allow` (replace with the actual id shown).
+
+3. **Exit:** Press `Ctrl+C` or type `/exit`
+
+[Back to top](#table-of-contents)
+
+### Test 4: Node Invoke (Non-Interactive)
+
+```bash
+# Get alice's connected node ID
+ALICE_NODE=$(kubectl exec -n openclaw deployment/openclaw-brain-alice -- \
+  npx openclaw nodes status --json 2>/dev/null | jq -r '.nodes[] | select(.connected) | .id')
+
+# Invoke a system command
+kubectl exec -n openclaw deployment/openclaw-brain-alice -- \
+  npx openclaw nodes invoke --node "$ALICE_NODE" \
+  --command system.which --params '{"bins":["cmd","powershell","node"]}'
+
+# Expected: {"ok":true, "payload":{"bins":{"cmd":"C:\\Windows\\system32\\cmd.exe",...}}}
+```
+
+[Back to top](#table-of-contents)
+
+### Test 5: Multi-Developer Isolation
+
+```bash
+# Write a file in alice's pod
+kubectl exec -n openclaw deployment/openclaw-brain-alice -- \
+  bash -c 'echo "alice-private" > /tmp/secret.txt'
+
+# Verify bob cannot see it
+kubectl exec -n openclaw deployment/openclaw-brain-bob -- \
+  cat /tmp/secret.txt 2>&1
+# Expected: "No such file or directory"
+
+# Verify alice can still read it
+kubectl exec -n openclaw deployment/openclaw-brain-alice -- cat /tmp/secret.txt
+# Expected: "alice-private"
+```
+
+[Back to top](#table-of-contents)
+
+### Test 6: PVC Persistence
+
+```bash
+# Write a marker file to the PVC mount
+kubectl exec -n openclaw deployment/openclaw-brain-alice -- \
+  bash -c 'echo "persist-test" > /home/openclaw/.openclaw/marker.txt'
+
+# Delete the pod (deployment recreates it)
+kubectl delete pod -n openclaw -l developer=alice
+
+# Wait for new pod
+kubectl wait --for=condition=ready pod -n openclaw -l developer=alice --timeout=120s
+
+# Verify the file survived
+kubectl exec -n openclaw deployment/openclaw-brain-alice -- \
+  cat /home/openclaw/.openclaw/marker.txt
+# Expected: "persist-test"
+```
+
+[Back to top](#table-of-contents)
+
+### Test 7: Logging Pipeline
+
+```bash
+# Check logs are flowing to Cloud Logging
+gcloud logging read \
+  'resource.type="k8s_container" AND resource.labels.namespace_name="openclaw"' \
+  --project=$PROJECT_ID --limit=5 --format='value(textPayload)'
+
+# Verify log sink exists
+gcloud logging sinks list --project=$PROJECT_ID
+
+# Verify alert policies
+gcloud alpha monitoring policies list --project=$PROJECT_ID \
+  --format='table(displayName,enabled)'
+```
+
+Expected:
+- Recent log entries from OpenClaw pods
+- Log sink pointing to a GCS bucket
+- Alert policies for CrashLoop, Node Disconnected, Exec Denied, and VM Node Host Failure
+
+[Back to top](#table-of-contents)
+
+### Test 8: Outbound Network Access
+
+```bash
+kubectl exec -n openclaw deployment/openclaw-brain-alice -- \
+  curl -s -o /dev/null -w '%{http_code}' https://www.google.com
+# Expected: 200 (Cloud NAT provides outbound access)
+```
+
+[Back to top](#table-of-contents)
+
+---
+
+## Adding Messaging Channels
+
+[Back to top](#table-of-contents)
+
+OpenClaw supports 20+ channels including Telegram, WhatsApp, Slack, Discord, Signal, Google Chat, Microsoft Teams, and more. Channels are configured via **CLI commands** or the **Control UI** — no SSH or VM access required.
+
+### Telegram
+
+[Back to top](#table-of-contents)
+
+#### 1. Create a Telegram Bot
+
+1. Open Telegram and message [@BotFather](https://t.me/BotFather)
+2. Send `/newbot` and follow the prompts
+3. Copy the bot token (format: `123456789:ABCdefGHIjklMNOpqrsTUVwxyz`)
+
+#### 2. Add the Channel via CLI
+
+```bash
+kubectl exec -n openclaw deploy/openclaw-brain-alice -- \
+  openclaw channels add telegram --bot-token "YOUR_BOT_TOKEN"
+```
+
+#### 3. Restart the Pod
+
+```bash
+kubectl delete pod -n openclaw -l developer=alice
+```
+
+#### 4. Test
+
+Send a message to your bot on Telegram. You should receive a response from the OpenClaw agent.
+
+#### 5. Optional: Restrict Access
+
+To require pairing codes for Telegram conversations:
+
+```bash
+kubectl exec -n openclaw deploy/openclaw-brain-alice -- \
+  openclaw config set channels.telegram.dmPolicy "pairing"
+```
+
+[Back to top](#table-of-contents)
+
+### WhatsApp
+
+[Back to top](#table-of-contents)
+
+#### 1. Add WhatsApp (Interactive — displays QR code)
+
+```bash
+kubectl exec -it -n openclaw deploy/openclaw-brain-alice -- \
+  openclaw channels add whatsapp
+```
+
+#### 2. Scan the QR Code
+
+Scan the QR code displayed in the terminal with your WhatsApp app.
+
+#### 3. Restart the Pod
+
+```bash
+kubectl delete pod -n openclaw -l developer=alice
+```
+
+#### 4. Test
+
+Send a message to the linked WhatsApp number. The agent should respond.
+
+[Back to top](#table-of-contents)
+
+### Slack
+
+[Back to top](#table-of-contents)
+
+#### 1. Create a Slack App
+
+1. Go to [api.slack.com/apps](https://api.slack.com/apps) and create a new app
+2. Under **OAuth & Permissions**, add bot scopes: `chat:write`, `app_mentions:read`, `im:history`
+3. Install the app to your workspace
+4. Copy the **Bot Token** (`xoxb-...`) and **App Token** (`xapp-...`)
+
+#### 2. Add the Channel via CLI
+
+```bash
+kubectl exec -n openclaw deploy/openclaw-brain-alice -- \
+  openclaw channels add slack --app-token "xapp-..." --bot-token "xoxb-..."
+```
+
+#### 3. Restart the Pod
+
+```bash
+kubectl delete pod -n openclaw -l developer=alice
+```
+
+#### 4. Test
+
+Message the bot in Slack. It should respond via the OpenClaw agent.
+
+[Back to top](#table-of-contents)
+
+### Managing Channels
+
+```bash
+# List configured channels
+kubectl exec -n openclaw deploy/openclaw-brain-alice -- openclaw channels list
+
+# Check channel status
+kubectl exec -n openclaw deploy/openclaw-brain-alice -- openclaw channels status
+
+# Remove a channel
+kubectl exec -n openclaw deploy/openclaw-brain-alice -- openclaw channels remove
+
+# Or use the Control UI via port-forward:
+kubectl port-forward -n openclaw svc/openclaw-gateway-alice 18789:18789
+# Then open http://localhost:18789
+```
+
+### Supported Channels
+
+| Channel | Auth Method |
+|---------|-------------|
+| Telegram | Bot token (from @BotFather) |
+| WhatsApp | QR code scan (`kubectl exec -it`) |
+| Slack | App token + Bot token |
+| Discord | Bot token |
+| Signal | Linked device (QR code) |
+| Google Chat | Service account |
+| Microsoft Teams | App credentials |
+| IRC | Server/nick config |
+| Matrix | Homeserver + access token |
+
+For full channel documentation, see the [OpenClaw Channels docs](https://docs.openclaw.ai/channels).
+
+[Back to top](#table-of-contents)
 
 ---
 
 ## Execution VM (Optional)
 
-By default, only the GKE brain pods are deployed (`exec_vms = {}`). To add execution VMs, define them in the `exec_vms` map. You can deploy any combination of Windows and Linux VMs:
+[Back to top](#table-of-contents)
+
+By default, only the GKE brain pods are deployed (`exec_vms = {}`). To add execution VMs, define them in the `exec_vms` map:
 
 ```hcl
 exec_vms = {
-  # Both Windows and Linux
   "windows" = { os_image = "windows-cloud/windows-2022-core" }
   "linux"   = { os_image = "debian-cloud/debian-12" }
-}
-```
-
-```hcl
-exec_vms = {
-  # Linux only
-  "linux" = {
-    os_image          = "debian-cloud/debian-12"
-    machine_type      = "e2-standard-4"
-    boot_disk_size_gb = 100
-  }
 }
 ```
 
@@ -165,9 +740,7 @@ The OS type is auto-detected from the image name:
 | Any image containing "windows" | Windows | Scheduled Tasks (SYSTEM) | `scripts/windows_startup.ps1` |
 | Any other image | Linux | systemd services | `scripts/linux_startup.sh` |
 
-Each VM is named `openclaw-exec-{key}` (e.g., `openclaw-exec-windows`, `openclaw-exec-linux`).
-
-### What the Execution VMs Enable
+### What Gets Created
 
 When `exec_vms` is non-empty, Terraform creates:
 - A GCE VM per entry (no public IP, Shielded VM)
@@ -176,683 +749,45 @@ When `exec_vms` is non-empty, Terraform creates:
 - Per-developer Internal Load Balancer services on GKE
 - Per-developer node host processes on each VM (auto-paired with gateway pods)
 
-Each developer gets a connected node host on **every** VM — e.g., with both Windows and Linux VMs, alice sees `linux-alice` and `windows-alice` as connected nodes.
-
-### Data Flow: Agent Command Execution (with VM)
+### Data Flow: Agent Command Execution
 
 ```mermaid
 graph LR
-    A["Developer (TUI)"] --> B["OpenClaw Agent<br/>(Pod)"]
+    A["Developer (TUI)"] --> B["OpenClaw Agent\n(Pod)"]
     B --> C["Gateway"]
-    C -->|TLS WebSocket| D["Node Host<br/>(Execution VM)"]
+    C -->|"TLS WebSocket"| D["Node Host\n(Execution VM)"]
     D --> E["OS Commands"]
     E --> D
-    D -->|Result| C
+    D -->|"Result"| C
     C --> B
     B --> A
 ```
 
 ### Automated Node Host Pairing
 
-Node host pairing is fully automated -- no manual approval needed:
+Pairing is fully automated — no manual approval needed:
 
 1. Gateway pod starts with a background auto-approve loop (`entrypoint.sh`)
 2. VM startup script cleans stale device identity on every boot, then starts per-developer node hosts
-3. Each node host connects to its developer's ILB, sends a pairing request
+3. Each node host connects to its developer's ILB and sends a pairing request
 4. The auto-approve loop detects pending `role=node` requests and approves them within ~15 seconds
 5. The node host reconnects and is fully operational
 
----
-
-## Multi-Tenant Design
-
-Each developer gets fully isolated resources, driven by the `var.developers` map:
-
-```hcl
-developers = {
-  "alice" = { active = true }
-  "bob"   = { active = true }
-  "carol" = { active = false }  # Pod scaled to 0, PVC preserved
-}
-```
-
-### Per-Developer Resources
-
-| Resource | Naming | Purpose |
-|----------|--------|---------|
-| **Deployment** | `openclaw-brain-{name}` | Isolated AI agent pod with Kata runtime |
-| **PVC** | `openclaw-pvc-{name}` | 10Gi persistent storage for workspace, state, sessions |
-| **K8s Service (ILB)** *(VM only)* | `openclaw-gateway-{name}` | Internal Load Balancer for VM node host connectivity |
-| **Node Host** *(VM only)* | `openclaw-node-{name}` | Node host process on execution VM |
-
-### Shared Resources
-
-| Resource | Purpose |
-|----------|---------|
-| LiteLLM Proxy | Single deployment proxying all LLM requests to Vertex AI |
-| Execution VM *(optional)* | Shared execution environment (each developer gets their own node host process with isolated state) |
-| Gateway TLS Certificate | Single self-signed cert with fingerprint pinning |
-| Gateway Auth Token | Single token in Secret Manager, used by all pods and node hosts |
-
-### Scaling
-
-| Dimension | How |
-|-----------|-----|
-| Add developer | Add entry to `var.developers`, run `terraform apply` |
-| Deactivate developer | Set `active = false` -- pod scales to 0, PVC preserved |
-| Remove developer | Delete entry from map -- all resources destroyed |
-| Add execution VMs | Add entries to `exec_vms` map with OS image |
-| More VM capacity | Increase `exec_vm_machine_type` (e.g., `e2-standard-4`) |
-
----
-
-## Security Features
-
-### Network Security
-
-- **No public IPs** on any resource (GKE nodes, Windows VM)
-- **IAP-only access** -- SSH/RDP via Identity-Aware Proxy tunnel only (`35.235.240.0/20`)
-- **Default-deny firewall** -- explicit allow rules for IAP SSH and Windows-to-GKE (port 18789)
-- **Private GKE cluster** -- private nodes, master authorized networks restricted to VPC subnets and admin CIDRs
-- **Cloud NAT** -- outbound internet without public IPs, NAT logging enabled
-- **VPC flow logs** -- enabled on GKE subnet with full metadata
-
-### Identity and Access
-
-- **Dedicated service accounts** per component (brain, Windows VM, GKE nodes, Cloud Build) -- never uses default compute SA
-- **Workload Identity** -- Kubernetes SA bound to GCP SA, no service account keys
-- **Per-secret IAM** -- each Secret Manager secret has individual IAM bindings (not project-wide `secretAccessor`)
-- **IAP tunnel access** -- optional deployer SA with `iap.tunnelResourceAccessor` role
-
-### Compute Security
-
-- **Kata Containers** -- VM-level isolation for all OpenClaw pods (nested virtualization on N2 nodes)
-- **Non-root containers** -- OpenClaw image runs as UID 10001, enforced by pod `securityContext` (`runAsNonRoot: true`)
-- **Shielded VMs** -- Secure Boot, vTPM, Integrity Monitoring on Windows VM and GKE default pool
-- **GKE release channel** -- `REGULAR` channel for automatic security patching
-
-### Secrets Management
-
-- **GCP Secret Manager** for all credentials (gateway token, Brave API key)
-- **Auto-generated gateway token** -- 48-char hex token if not provided
-- **TF_VAR environment variables** for sensitive inputs (never in `terraform.tfvars`)
-- **Remote state** -- GCS backend with versioning (configure bucket via `terraform init -backend-config="bucket=YOUR_BUCKET"`)
-
-### Application Security
-
-- **TLS with fingerprint pinning** -- self-signed ECDSA P256 cert, SHA256 fingerprint validated by node hosts
-- **Token authentication** -- gateway requires auth token for all connections
-- **Exec security** -- configurable per-agent via `exec-approvals.json` (see [Exec Approval Configuration](#exec-approval-configuration))
-- **Restricted envsubst** -- only named variables substituted (`$MODEL_PRIMARY,$MODEL_FALLBACKS,$GATEWAY_AUTH_TOKEN`)
-- **Container vulnerability scanning** -- `containerscanning.googleapis.com` API enabled on Artifact Registry
-- **Pinned LiteLLM image** -- SHA256 digest, not mutable tag
-- **Cluster deletion protection** -- `deletion_protection = true`
-- **Automated node pairing** -- background auto-approve for `role=node` devices only; operator devices still auto-approved by gateway
-- **Device auth disabled (`dangerouslyDisableDeviceAuth: true`)** -- required for headless GKE deployments (see [Device Auth Design Decision](#device-auth-design-decision) below)
-
-### Device Auth Design Decision
-
-This deployment sets `dangerouslyDisableDeviceAuth: true` in the gateway configuration. This is a deliberate design decision for headless/server deployments, **not** a security oversight.
-
-**Why it must be `true`:** With `dangerouslyDisableDeviceAuth: false`, every WebSocket connection (operator CLI, node hosts, Control UI) requires interactive device pairing approval. In a headless GKE deployment there is no interactive UI to approve the first operator pairing — creating a chicken-and-egg problem where nothing can connect. Setting it to `false` will permanently lock out all connections if pairing data is ever lost.
-
-**Why it is still secure:**
-
-| Layer | Protection |
-|-------|-----------|
-| **Network isolation** | Gateway is on a private ILB (10.10.0.0/24), not internet-exposed |
-| **Token authentication** | All WebSocket connections require `OPENCLAW_GATEWAY_TOKEN` from Secret Manager |
-| **Channel-level access** | Per-channel `dmPolicy: "pairing"` controls who can interact via Telegram/WhatsApp |
-| **VPC firewall** | Only VMs on the VPC and pods in the cluster can reach the gateway |
-
-**When to use `false`:** Only in interactive desktop deployments where an operator can manually approve device pairings through the UI.
-
-> **Warning:** Never set `dangerouslyDisableDeviceAuth: false` in headless deployments. If you need to control channel access (e.g., require pairing codes for Telegram), use `dmPolicy: "pairing"` on each channel instead.
-
-### Exec Approval Configuration
-
-OpenClaw has a two-layer exec approval system — both the **gateway** and each **node host** independently control whether commands require approval. By default, this deployment does **not** pre-configure exec approvals, so OpenClaw's built-in defaults apply.
-
-> **Recommendation:** For production environments, configure exec approvals to control which commands the agent can run without user confirmation. This is especially important when node hosts have access to sensitive systems.
-
-#### Settings Reference
-
-| Setting | Value | Effect |
-|---------|-------|--------|
-| `security` | `"full"` | Allow all commands without restriction |
-| `security` | `"allowlist"` | Only allow commands listed in `safeBins` (requires `safeBinProfiles` in OpenClaw 2026.4+) |
-| `ask` | `"off"` | Never prompt for approval |
-| `ask` | `"always"` | Prompt for every command via TUI |
-| `askFallback` | `"full"` | If approval prompt times out, auto-approve |
-| `askFallback` | `"deny"` | If approval prompt times out, deny |
-
-#### Configuring Approval Behavior
-
-**Via CLI (gateway pod):**
-
-```bash
-kubectl exec -n openclaw deploy/openclaw-brain-alice -- \
-  openclaw config set tools.exec.security full
-
-kubectl exec -n openclaw deploy/openclaw-brain-alice -- \
-  openclaw config set tools.exec.ask off
-```
-
-**Via CLI (on a node host VM):**
-
-```bash
-# Auto-approve all commands
-openclaw config set tools.exec.security full
-openclaw config set tools.exec.ask off
-
-# Require approval for every command
-openclaw config set tools.exec.ask always
-
-# Restrict to allowlisted commands only
-openclaw config set tools.exec.security allowlist
-```
-
-**Via `exec-approvals.json`** (place in the OpenClaw state directory):
-
-```json
-{
-  "version": 1,
-  "defaults": {
-    "security": "full",
-    "ask": "off",
-    "askFallback": "full"
-  },
-  "agents": {
-    "main": {
-      "security": "full",
-      "ask": "off"
-    }
-  }
-}
-```
-
-Then apply: `openclaw approvals set /path/to/exec-approvals.json`
-
-You can also configure per-agent policies under the `agents` key to apply different approval rules for specific agents.
-
----
-
-## Deployment Guide
-
-### Prerequisites
-
-- [Terraform](https://developer.hashicorp.com/terraform/install) >= 1.5
-- [Google Cloud SDK](https://cloud.google.com/sdk/docs/install) (`gcloud`)
-- A GCP project with billing enabled
-- `kubectl` installed
-- Authenticated credentials:
-  ```bash
-  gcloud auth application-default login
-  gcloud auth login
-  ```
-
-### Step 1: Create GCS Backend Bucket
-
-The Terraform state is stored in a GCS bucket. Create it before initializing:
-
-```bash
-PROJECT_ID="my-gcp-project"
-BUCKET="${PROJECT_ID}-tf-state"
-
-gsutil mb -p "$PROJECT_ID" -l asia-southeast1 "gs://$BUCKET"
-gsutil versioning set on "gs://$BUCKET"
-```
-
-### Step 2: Clone and Configure
-
-```bash
-git clone <repository-url>
-cd terraform-openclaw-gcp-gke
-```
-
-Create your variables file:
-
-```bash
-cp terraform.tfvars.example terraform.tfvars
-```
-
-Edit `terraform.tfvars` with your project settings:
-
-```hcl
-project_id = "my-gcp-project"
-region     = "asia-southeast1"
-zone       = "asia-southeast1-a"
-
-openclaw_version = "latest"
-model_primary    = "litellm/gemini-3.1-pro-preview"
-model_fallbacks  = "[\"litellm/gemini-3.1-flash-lite-preview\"]"
-
-developers = {
-  "alice" = { active = true }
-  "bob"   = { active = true }
-}
-
-# ── Optional: Execution VMs ─────────────────────────────────────────────────
-# Uncomment to add VMs for OS-native command execution.
-
-# exec_vms = {
-#   "windows" = { os_image = "windows-cloud/windows-2022-core" }
-#   "linux"   = { os_image = "debian-cloud/debian-12" }
-# }
-```
-
-Set sensitive variables via environment:
-
-```bash
-export TF_VAR_gateway_auth_token=""  # leave empty to auto-generate
-export TF_VAR_brave_api_key=""       # optional
-```
-
-### Step 3: Initialize and Deploy
-
-```bash
-terraform init -backend-config="bucket=${PROJECT_ID}-tf-state"
-terraform plan
-terraform apply
-```
-
-This creates all infrastructure (~15-20 minutes):
-- VPC, subnets, firewall rules, Cloud NAT
-- GKE Standard cluster with Kata-enabled node pool
-- Kata Containers installed via Helm
-- Per-developer OpenClaw pods and PVCs
-- LiteLLM proxy deployment
-- Secret Manager secrets and IAM bindings
-- *(If `exec_vms` is non-empty)* Execution VMs, per-developer ILB services, VM subnet/firewall/SA
-
-### Step 4: Build and Push the OpenClaw Container Image
-
-> **Skip this step** if you set `sandbox_image` to a custom pre-built image in your `terraform.tfvars`.
-
-When no `sandbox_image` is specified (default), you must build and push the vanilla OpenClaw image to your Artifact Registry:
-
-```bash
-export PROJECT_ID="my-gcp-project"
-export REGION="asia-southeast1"
-./scripts/build_and_push.sh
-```
-
-### Step 5: Restart Pods to Pull the New Image
-
-```bash
-kubectl rollout restart deployment -n openclaw -l component=brain
-```
-
-### Step 6: Verify Deployment
-
-See [Connecting to the GKE Cluster](#connecting-to-the-gke-cluster) and [Verify Pods Are Running](#verify-pods-are-running) in the End-to-End Testing section below.
-
-### Step 7: Verify Node Host Pairing (only if `exec_vms` is non-empty)
-
-Wait 3-5 minutes for the VM startup script to install OpenClaw, clean stale identity, and start node hosts. Pairing is fully automated:
-
-```bash
-# Check alice's node connection
-kubectl exec -n openclaw deployment/openclaw-brain-alice -- npx openclaw nodes status
-
-# Expected: Known: 1 · Paired: 1 · Connected: 1
-# Node: windows-alice (or linux-alice), Status: paired · connected
-
-# Check bob
-kubectl exec -n openclaw deployment/openclaw-brain-bob -- npx openclaw nodes status
-```
-
-If nodes show "disconnected", check the gateway logs for auto-approve activity:
-
-```bash
-kubectl logs -n openclaw deployment/openclaw-brain-alice --tail=20 | grep -E "auto-pair|auto-approved|pairing"
-```
-
----
-
-## End-to-End Testing
-
-### Connecting to the GKE Cluster
-
-After `terraform apply` completes, configure `kubectl` to connect to the cluster:
-
-```bash
-# Get cluster credentials
-gcloud container clusters get-credentials openclaw-cluster \
-  --region $(terraform output -raw gke_cluster_region 2>/dev/null || echo "us-central1") \
-  --project $(terraform output -raw project_id 2>/dev/null || echo "$PROJECT_ID")
-
-# Verify connectivity
-kubectl cluster-info
-kubectl get namespaces | grep openclaw
-```
-
-> **Important:** Your client IP must be in the `master_authorized_cidrs` list or within the GKE/exec-VM subnets. If you're using Cloud Shell, add its CIDR to `master_authorized_cidrs` in your `terraform.tfvars`:
->
-> ```hcl
-> master_authorized_cidrs = {
->   "Cloud Shell" = "34.80.0.0/16"   # Adjust for your region
->   "Office VPN"  = "203.0.113.0/24"
-> }
-> ```
-
-### Verify Pods Are Running
-
-```bash
-# Check all pods in the openclaw namespace
-kubectl get pods -n openclaw
-
-# Expected output:
-# NAME                                    READY   STATUS    AGE
-# litellm-xxxxx                           1/1     Running   5m
-# openclaw-brain-alice-xxxxx              1/1     Running   5m
-# openclaw-brain-bob-xxxxx                1/1     Running   5m
-
-# Verify Kata runtime is active
-kubectl get pods -n openclaw -o jsonpath='{range .items[*]}{.metadata.name}{" -> "}{.spec.runtimeClassName}{"\n"}{end}'
-
-# Verify non-root
-kubectl exec -n openclaw deployment/openclaw-brain-alice -- id
-# uid=10001(openclaw) gid=10001(openclaw) groups=10001(openclaw)
-
-# Check ILB services have IPs (only if exec_vms is non-empty)
-kubectl get svc -n openclaw
-```
-
-### Test via Node Invoke (non-interactive)
-
-```bash
-# Get alice's connected node ID
-ALICE_NODE=$(kubectl exec -n openclaw deployment/openclaw-brain-alice -- \
-  npx openclaw nodes status --json 2>/dev/null | jq -r '.nodes[] | select(.connected) | .id')
-
-# Invoke system.which on Windows
-kubectl exec -n openclaw deployment/openclaw-brain-alice -- \
-  npx openclaw nodes invoke --node "$ALICE_NODE" \
-  --command system.which --params '{"bins":["cmd","powershell","node"]}'
-
-# Expected: {"ok":true, "payload":{"bins":{"cmd":"C:\\Windows\\system32\\cmd.exe",...}}}
-```
-
-### Test via OpenClaw TUI (interactive)
-
-```bash
-# Launch the TUI inside alice's pod
-kubectl exec -it -n openclaw deployment/openclaw-brain-alice -- npx openclaw tui
-```
-
-Once in the TUI:
-
-1. **Test command execution:**
-   ```
-   You: Run "hostname" on the Windows node host
-   ```
-
-2. **Approve the command:** The agent will prepare the command and request approval. An approval box will appear in the TUI output:
-   ```
-   ┌─ exec ──────────────────────────────
-   │ hostname
-   │ host: windows-alice
-   │ id: a1b2c3
-   │ ─────────────────────────────────
-   │ /approve a1b2c3 allow
-   └─────────────────────────────────────
-   ```
-   Scroll up if needed to find the approval box and note the **id** (e.g., `a1b2c3`). Then type:
-   ```
-   /approve a1b2c3 allow
-   ```
-   Replace `a1b2c3` with the actual id shown in your approval box.
-
-3. **Expected result:**
-   ```
-   Agent: The hostname is "openclaw-exec-windows"
-   ```
-
-4. **Test more commands:**
-   ```
-   You: Run "ver" on the Windows node to get the Windows version
-   # Approve when prompted, then:
-   Agent: Microsoft Windows [Version 10.0.20348.xxxx]
-   ```
-
-   ```
-   You: Run "Get-Process | Select-Object -First 5" on the Windows node via PowerShell
-   ```
-
-5. **Exit:** Press `Ctrl+C` or type `/exit`
-
-> **Tip:** If you cannot find the approval id, scroll up in the TUI — the approval box may be above the current viewport. The id is a short alphanumeric string shown in the exec approval block.
-
-### Test Bob's Pod
-
-Repeat the same steps for Bob:
-
-```bash
-kubectl exec -it -n openclaw deployment/openclaw-brain-bob -- npx openclaw tui
-```
-
-### Verify Isolation
-
-Alice and Bob have separate:
-- Pods (different deployments)
-- PVCs (different persistent volumes)
-- Node host processes on Windows (different scheduled tasks)
-- Sessions and state (different `OPENCLAW_STATE_DIR` paths on both Linux and Windows)
-
-### Troubleshooting
-
-#### `kubectl` cannot connect / hangs / times out
-
-Your IP is not in the GKE master authorized networks. Fix:
-
-```bash
-# Check your current public IP
-curl -s ifconfig.me
-
-# Add it to terraform.tfvars
-master_authorized_cidrs = {
-  "My IP" = "YOUR_IP/32"
-}
-
-# Apply the change (updates the cluster, no downtime)
-terraform apply
-```
-
-If using Cloud Shell, add the Cloud Shell CIDR for your region (e.g., `34.80.0.0/16` for Asia, `35.235.240.0/20` for US). Check the [Cloud Shell IP ranges](https://cloud.google.com/shell/docs/limitations#ip_address_ranges) documentation.
-
-#### Pods stuck in `Pending` or `ContainerCreating`
-
-```bash
-# Check events for the pod
-kubectl describe pod -n openclaw <pod-name>
-
-# Common causes:
-# - "no nodes available": Node pool still provisioning (~5 min)
-# - "kata-clh runtime class not found": Kata not yet installed, wait for Helm release
-kubectl get runtimeclass kata-clh
-
-# - Image pull error: Build and push the image first (Step 4)
-kubectl get events -n openclaw --sort-by='.lastTimestamp' | tail -20
-```
-
-#### Node hosts show "disconnected"
-
-```bash
-# Check node status from the brain pod
-kubectl exec -n openclaw deployment/openclaw-brain-alice -- npx openclaw nodes status
-
-# Check gateway auto-approve logs
-kubectl logs -n openclaw deployment/openclaw-brain-alice --tail=30 | grep -E "auto-pair|auto-approved|pairing"
-
-# On Linux VM: check systemd service
-gcloud compute ssh openclaw-exec-linux --zone=ZONE --tunnel-through-iap \
-  -- sudo journalctl -u openclaw-node-alice -n 50
-
-# On Windows VM: check scheduled task output
-gcloud compute ssh openclaw-exec-windows --zone=ZONE --tunnel-through-iap \
-  -- powershell "Get-Content C:\\openclaw\\nodes\\alice\\node-host.log -Tail 30"
-```
-
-Common causes:
-- **Stale device identity** — restart the VM to trigger the startup script cleanup
-- **ILB not ready** — wait 2-3 minutes for the internal load balancer IP to provision (`kubectl get svc -n openclaw`)
-- **Gateway token mismatch** — verify the token in Secret Manager matches what the VM fetched at boot
-
-#### Exec VM cannot reach GKE API
-
-```bash
-# Verify firewall rule exists
-gcloud compute firewall-rules list --filter="name~exec-vm" --project=$PROJECT_ID
-
-# Verify the VM subnet is in master_authorized_networks
-gcloud container clusters describe openclaw-cluster --region=REGION \
-  --format="yaml(masterAuthorizedNetworksConfig)"
-```
-
-#### LiteLLM returning errors
-
-```bash
-# Check LiteLLM logs
-kubectl logs -n openclaw deployment/litellm --tail=50
-
-# Test Vertex AI connectivity from LiteLLM pod
-kubectl exec -n openclaw deployment/litellm -- curl -s http://localhost:4000/health
-
-# Verify Workload Identity is bound
-kubectl describe sa openclaw-brain -n openclaw | grep annotation
-```
-
----
-
-## Channel Configuration
-
-OpenClaw supports 20+ channels including Telegram, WhatsApp, Slack, Discord, Signal, Google Chat, Microsoft Teams, and more. Channels are configured via **CLI commands** or the **Control UI** -- no SSH or VM access required.
-
-### Option 1: CLI via kubectl exec (Recommended)
-
-Run `openclaw` commands directly inside the gateway pod from your Cloud Shell or local terminal:
-
-```bash
-# Add Telegram
-kubectl exec -n openclaw deploy/openclaw-alice -- \
-  openclaw channels add telegram --bot-token "YOUR_BOT_TOKEN"
-
-# Add Discord
-kubectl exec -n openclaw deploy/openclaw-alice -- \
-  openclaw channels add discord --bot-token "YOUR_DISCORD_TOKEN"
-
-# Add Slack
-kubectl exec -n openclaw deploy/openclaw-alice -- \
-  openclaw channels add slack --app-token "xapp-..." --bot-token "xoxb-..."
-
-# Add WhatsApp (interactive -- displays QR code in terminal)
-kubectl exec -it -n openclaw deploy/openclaw-alice -- \
-  openclaw channels add whatsapp
-```
-
-**Manage existing channels:**
-
-```bash
-# List configured channels
-kubectl exec -n openclaw deploy/openclaw-alice -- openclaw channels list
-
-# Check channel status
-kubectl exec -n openclaw deploy/openclaw-alice -- openclaw channels status
-
-# Remove a channel
-kubectl exec -n openclaw deploy/openclaw-alice -- openclaw channels remove
-
-# Update a channel setting
-kubectl exec -n openclaw deploy/openclaw-alice -- \
-  openclaw config set channels.telegram.dmPolicy "pairing"
-```
-
-### Option 2: Control UI (Web Interface)
-
-Each developer's gateway pod exposes the Control UI on port 18789 via the Internal Load Balancer:
-
-```
-http://<ILB_IP>:18789
-```
-
-To find your ILB IP:
-
-```bash
-kubectl get svc -n openclaw -l component=brain
-```
-
-> **Note:** The Control UI is only accessible from networks included in the VPC routing (GKE subnet, exec VM subnet). Use `kubectl port-forward` if accessing from outside the VPC:
-> ```bash
-> kubectl port-forward -n openclaw svc/openclaw-alice 18789:18789
-> # Then open http://localhost:18789
-> ```
-
-1. Open the Control UI in your browser
-2. Navigate to the **Configuration** tab
-3. Add your channel under the `channels` key using the Raw JSON editor or form fields
-4. The gateway hot-reloads configuration changes -- no restart needed
-
-### Example Channel Configurations
-
-**Telegram:**
-```json
-"channels": {
-  "telegram": {
-    "enabled": true,
-    "token": "123456789:AAExxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-  }
-}
-```
-
-**WhatsApp (Baileys):**
-```json
-"channels": {
-  "whatsapp": {
-    "enabled": true
-  }
-}
-```
-After adding WhatsApp, scan the QR code displayed in the Control UI or via `kubectl exec -it`.
-
-**Slack:**
-```json
-"channels": {
-  "slack": {
-    "enabled": true,
-    "appToken": "xapp-...",
-    "botToken": "xoxb-..."
-  }
-}
-```
-
-### Supported Channels
-
-| Channel | Auth Method |
-|---------|-------------|
-| Telegram | Bot token (from @BotFather) |
-| WhatsApp | QR code scan (Control UI or `kubectl exec -it`) |
-| Slack | App token + Bot token |
-| Discord | Bot token |
-| Signal | Linked device (QR code) |
-| Google Chat | Service account |
-| Microsoft Teams | App credentials |
-| IRC | Server/nick config |
-| Matrix | Homeserver + access token |
-
-For full channel documentation, see the [OpenClaw Channels docs](https://docs.openclaw.ai/channels).
+[Back to top](#table-of-contents)
 
 ---
 
 ## Windows VM Golden Image
 
-This guide covers building a pre-configured Windows Server golden image with OpenClaw, Node.js, and all dependencies pre-installed, then deploying it to this project.
+[Back to top](#table-of-contents)
+
+Build a pre-configured Windows Server golden image with OpenClaw, Node.js, and all dependencies pre-installed.
 
 ### Step 1: Create a Source VM
 
 ```bash
 gcloud compute instances create openclaw-win-builder \
-  --project=my-gcp-project \
+  --project=$PROJECT_ID \
   --zone=asia-southeast1-a \
   --machine-type=e2-standard-4 \
   --image-project=windows-cloud \
@@ -863,8 +798,10 @@ gcloud compute instances create openclaw-win-builder \
   --shielded-vtpm \
   --shielded-integrity-monitoring \
   --no-address \
-  --subnet=projects/my-gcp-project/regions/asia-southeast1/subnetworks/openclaw-vpc-windows-subnet
+  --subnet=projects/$PROJECT_ID/regions/asia-southeast1/subnetworks/openclaw-vpc-windows-subnet
 ```
+
+[Back to top](#table-of-contents)
 
 ### Step 2: Connect and Install Software
 
@@ -877,13 +814,9 @@ gcloud compute reset-windows-password openclaw-win-builder \
 gcloud compute start-iap-tunnel openclaw-win-builder 3389 \
   --zone=asia-southeast1-a --local-host-port=localhost:33389
 # Then RDP to localhost:33389
-
-# Or use PowerShell via IAP SSH (if OpenSSH is installed)
-gcloud compute ssh openclaw-win-builder \
-  --zone=asia-southeast1-a --tunnel-through-iap
 ```
 
-Once connected, run the following in PowerShell:
+Once connected, run in PowerShell:
 
 ```powershell
 # Install Node.js 22 LTS
@@ -897,30 +830,29 @@ $env:PATH = "C:\Program Files\nodejs;$env:PATH"
 # Install OpenClaw
 npm install -g openclaw@latest --ignore-scripts
 
-# Create state directory
+# Create directories
 New-Item -ItemType Directory -Path "C:\openclaw\state" -Force
 New-Item -ItemType Directory -Path "C:\openclaw\nodes" -Force
-
-# Set environment variable
 [Environment]::SetEnvironmentVariable("OPENCLAW_STATE_DIR", "C:\openclaw\state", "Machine")
 
-# Clean up temp files
+# Clean up
 Remove-Item C:\Windows\Temp\node-installer.msi -Force -ErrorAction SilentlyContinue
-Remove-Item C:\Windows\Temp\*.log -Force -ErrorAction SilentlyContinue
 ```
+
+[Back to top](#table-of-contents)
 
 ### Step 3: Sysprep and Create Image
 
 ```powershell
-# On the VM -- generalize the image
+# On the VM — generalize the image
 & "$env:SystemRoot\System32\Sysprep\Sysprep.exe" /generalize /oobe /shutdown /quiet
 ```
 
-Wait for the VM to shut down, then create the image:
+Wait for the VM to shut down, then:
 
 ```bash
 gcloud compute images create openclaw-windows-golden-v1 \
-  --project=my-gcp-project \
+  --project=$PROJECT_ID \
   --source-disk=openclaw-win-builder \
   --source-disk-zone=asia-southeast1-a \
   --family=openclaw-windows \
@@ -929,26 +861,22 @@ gcloud compute images create openclaw-windows-golden-v1 \
   --description="OpenClaw Windows golden image with Node.js 22 and OpenClaw pre-installed"
 ```
 
-### Step 4: Clean Up the Builder VM
+[Back to top](#table-of-contents)
+
+### Step 4: Clean Up and Use
 
 ```bash
+# Delete the builder VM
 gcloud compute instances delete openclaw-win-builder \
   --zone=asia-southeast1-a --quiet
 ```
 
-### Step 5: Update Terraform to Use the Golden Image
-
-Edit `terraform.tfvars`:
+Update `terraform.tfvars` to use the golden image:
 
 ```hcl
-# In exec_vms map:
-# "windows" = { os_image = "projects/my-gcp-project/global/images/family/openclaw-windows" }
-```
-
-Or pin to a specific image version:
-
-```hcl
-# "windows" = { os_image = "projects/my-gcp-project/global/images/openclaw-windows-golden-v1" }
+exec_vms = {
+  "windows" = { os_image = "projects/my-gcp-project/global/images/family/openclaw-windows" }
+}
 ```
 
 Then apply:
@@ -957,61 +885,45 @@ Then apply:
 terraform apply
 ```
 
-The Windows VM will be recreated using the golden image. The startup script (`windows_startup.ps1`) will still run to:
-- Update OpenClaw to the latest version
-- Fetch the gateway token from Secret Manager
-- Clean stale device identity from previous runs
-- Configure per-developer node hosts with isolated state directories
-- Start scheduled tasks that auto-reconnect on failure
-
-### Step 6: Automate Image Updates (Optional)
-
-Create a Cloud Build trigger or scheduled job to periodically rebuild the golden image with the latest patches:
-
-```bash
-# Schedule monthly image rebuild
-gcloud scheduler jobs create http openclaw-golden-image-rebuild \
-  --schedule="0 2 1 * *" \
-  --uri="https://cloudbuild.googleapis.com/v1/projects/my-gcp-project/triggers/golden-image:run" \
-  --http-method=POST \
-  --oauth-service-account-email=openclaw-cloudbuild@my-gcp-project.iam.gserviceaccount.com
-```
+[Back to top](#table-of-contents)
 
 ---
 
 ## Observability
+
+[Back to top](#table-of-contents)
 
 All OpenClaw logs from pods and VMs are collected, stored, and monitored through a unified observability stack managed entirely by Terraform.
 
 ```mermaid
 graph LR
     subgraph Sources
-        POD["Gateway Pods<br/>stdout/stderr"]
-        LINUX_VM["Linux VM<br/>journald"]
-        WIN_VM["Windows VM<br/>Event Log + File Logs"]
+        POD["Gateway Pods\nstdout/stderr"]
+        LINUX_VM["Linux VM\njournald"]
+        WIN_VM["Windows VM\nEvent Log + File Logs"]
     end
 
     subgraph Collection
         GKE_LOG["GKE Auto-shipping"]
-        OPS_LINUX["Ops Agent<br/>(systemd_journal)"]
-        OPS_WIN["Ops Agent<br/>(windows_event_log + files)"]
+        OPS_LINUX["Ops Agent\n(systemd_journal)"]
+        OPS_WIN["Ops Agent\n(windows_event_log + files)"]
     end
 
     subgraph Storage
-        CL["Cloud Logging<br/>(30-day retention)"]
-        GCS["GCS Bucket<br/>(90d Standard → Nearline<br/>365d → Coldline)"]
+        CL["Cloud Logging\n(30-day retention)"]
+        GCS["GCS Bucket\n(90d Standard → Nearline\n365d → Coldline)"]
     end
 
     subgraph Monitoring
         METRICS["Log-Based Metrics"]
-        ALERTS["Alert Policies<br/>(Email)"]
+        ALERTS["Alert Policies\n(Email)"]
         DASH["Operations Dashboard"]
     end
 
     POD --> GKE_LOG --> CL
     LINUX_VM --> OPS_LINUX --> CL
     WIN_VM --> OPS_WIN --> CL
-    CL -->|Log Sink| GCS
+    CL -->|"Log Sink"| GCS
     CL --> METRICS --> ALERTS
     METRICS --> DASH
 ```
@@ -1020,45 +932,27 @@ graph LR
 
 | Source | Mechanism | What's Collected |
 |--------|-----------|-----------------|
-| **Gateway pods** | GKE auto-ships stdout/stderr to Cloud Logging | Gateway startup, WebSocket activity, pairing, exec results, errors |
-| **Linux VM** | Ops Agent (`systemd_journal` receiver, `openclaw-node-*` units) | Node host connect/disconnect, exec output, restart events |
-| **Windows VM** | Ops Agent (`windows_event_log` + `files` receiver for `C:\openclaw\logs\*.log`) | Node host output, scheduled task events, errors |
-
-Ops Agent is installed automatically by the VM startup scripts on first boot. It also collects host-level metrics (CPU, memory, disk) at 60-second intervals.
+| **Gateway pods** | GKE auto-ships stdout/stderr | Gateway startup, WebSocket activity, pairing, exec results, errors |
+| **Linux VM** | Ops Agent (`systemd_journal` receiver) | Node host connect/disconnect, exec output, restart events |
+| **Windows VM** | Ops Agent (`windows_event_log` + `files` receiver) | Node host output, scheduled task events, errors |
 
 ### Log Storage
 
-Logs flow through two tiers:
-
 | Tier | Retention | Use Case |
 |------|-----------|----------|
-| **Cloud Logging** | 30 days (default) | Real-time querying, tailing, dashboard panels |
-| **GCS Bucket** (`{project_id}-openclaw-logs`) | Unlimited | Long-term retention, compliance, post-incident analysis |
+| **Cloud Logging** | 30 days | Real-time querying, tailing, dashboard panels |
+| **GCS Bucket** | Unlimited | Long-term retention, compliance, post-incident analysis |
 
-The GCS bucket uses lifecycle policies to reduce cost:
-- **0–90 days**: Standard storage (frequent access for debugging)
-- **90–365 days**: Nearline storage (occasional access)
-- **365+ days**: Coldline storage (rare access, compliance retention)
-
-The log sink exports all logs matching:
-```
-(resource.type="k8s_container" AND resource.labels.namespace_name="openclaw")
-OR
-(resource.type="gce_instance" AND resource.labels.instance_id=~"openclaw-exec-.*")
-```
+GCS lifecycle policies: 0–90 days Standard, 90–365 days Nearline, 365+ days Coldline.
 
 ### Alerting
 
-Four alert policies notify via email when operational issues are detected. Alerts are only created when `alert_email` is set in `terraform.tfvars`.
-
-| Alert | Trigger | Threshold | Meaning |
-|-------|---------|-----------|---------|
-| **Exec Approval Denied** | `SYSTEM_RUN_DENIED` in pod logs | Any occurrence | A node host denied a command -- exec-approvals.json has wrong defaults or the auto-push loop failed |
-| **Node Host Disconnected** | `NOT_CONNECTED: node not connected` | >50 in 5 minutes | Stale paired node entries or a VM is down |
-| **Gateway CrashLoop** | `CrashLoopBackOff` in pod logs | Any occurrence | Bad config, missing secrets, or throwOnLoadError crash |
-| **VM Node Host Failure** | `Node host exited` or `ERROR` in VM logs | >5 in 5 minutes | Node host process repeatedly crashing on a VM |
-
-Each alert includes runbook-style documentation with common causes and remediation steps.
+| Alert | Trigger | Meaning |
+|-------|---------|---------|
+| **Exec Approval Denied** | `SYSTEM_RUN_DENIED` in pod logs | Node host denied a command |
+| **Node Host Disconnected** | `NOT_CONNECTED` >50 in 5 min | Stale paired nodes or VM down |
+| **Gateway CrashLoop** | `CrashLoopBackOff` in pod logs | Bad config, missing secrets |
+| **VM Node Host Failure** | `Node host exited` or `ERROR` >5 in 5 min | Node host process crashing |
 
 To enable alerts:
 
@@ -1069,27 +963,29 @@ alert_email = "your-team@example.com"
 
 ### Dashboard
 
-The **"OpenClaw Operations"** dashboard in Cloud Monitoring provides a single-pane view of the entire system:
+Access at: **Cloud Console → Monitoring → Dashboards → OpenClaw Operations**
 
-| Panel | Type | Shows |
-|-------|------|-------|
-| **Gateway Pod Logs** | Log panel | All gateway pod logs (all developers) |
-| **Execution VM Logs** | Log panel | All VM logs (Linux + Windows) |
-| **Exec Denied Events** | Time-series chart | `SYSTEM_RUN_DENIED` events over time |
-| **Node Disconnection Errors** | Time-series chart | `NOT_CONNECTED` errors over time |
-| **VM Node Host Failures** | Time-series chart | VM node host errors over time |
-| **Gateway Errors Only** | Log panel | Severity >= ERROR from gateway pods |
-| **WebSocket Activity** | Log panel | All `[ws]` WebSocket request/response logs |
+| Panel | Shows |
+|-------|-------|
+| Gateway Pod Logs | All gateway pod logs (all developers) |
+| Execution VM Logs | All VM logs (Linux + Windows) |
+| Exec Denied Events | `SYSTEM_RUN_DENIED` events over time |
+| Node Disconnection Errors | `NOT_CONNECTED` errors over time |
+| VM Node Host Failures | VM node host errors over time |
+| Gateway Errors Only | Severity >= ERROR from gateway pods |
+| WebSocket Activity | All `[ws]` request/response logs |
 
-Access the dashboard at: **Cloud Console → Monitoring → Dashboards → OpenClaw Operations**
+[Back to top](#table-of-contents)
 
 ---
 
 ## Variables Reference
 
+[Back to top](#table-of-contents)
+
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `project_id` | Yes | -- | GCP project ID |
+| `project_id` | Yes | — | GCP project ID |
 | `region` | No | `us-central1` | GCP region |
 | `zone` | No | `us-central1-c` | GCE instance zone |
 | `network_name` | No | `openclaw-vpc` | VPC network name |
@@ -1100,25 +996,31 @@ Access the dashboard at: **Cloud Console → Monitoring → Dashboards → OpenC
 | `gke_machine_type` | No | `n2-standard-4` | GKE node machine type (must support nested virt) |
 | `gke_node_count` | No | `1` | Nodes per zone |
 | **Execution VMs** | | | |
-| `exec_vms` | No | `{}` | Map of execution VMs (see below) |
-| `master_authorized_cidrs` | No | `{}` | Additional CIDRs allowed to access GKE control plane |
+| `exec_vms` | No | `{}` | Map of execution VMs to deploy |
 | `exec_vm_subnet_cidr` | No | `10.20.0.0/24` | VM subnet CIDR |
+| `master_authorized_cidrs` | No | `{}` | Additional CIDRs for GKE control plane access |
 | **Secrets** | | | |
 | `gateway_auth_token` | No | auto-generated | Gateway auth token (sensitive) |
 | `brave_api_key` | No | `""` | Brave Search API key (sensitive) |
 | **OpenClaw** | | | |
-| `sandbox_image` | No | `""` (auto from Artifact Registry) | Custom Docker image for brain pods |
+| `sandbox_image` | No | `""` | Custom Docker image for brain pods |
 | `openclaw_version` | No | `latest` | OpenClaw npm package version |
 | `model_primary` | No | `litellm/gemini-3.1-pro-preview` | Primary LLM model |
 | `model_fallbacks` | No | `["litellm/gemini-3.1-flash-lite-preview"]` | Fallback models (JSON array) |
 | `developers` | No | `{"default" = {active = true}}` | Map of developer names to config |
 | `deployer_service_account` | No | `""` | SA email for IAP tunnel access |
 | **Monitoring** | | | |
-| `alert_email` | No | `""` | Email for operational alerts (exec denied, disconnects, crashes) |
+| `alert_email` | No | `""` | Email for operational alerts |
 | **Labels** | | | |
 | `labels` | No | `{app="openclaw",...}` | Resource labels |
 
+[Back to top](#table-of-contents)
+
+---
+
 ## Outputs Reference
+
+[Back to top](#table-of-contents)
 
 | Output | Description |
 |--------|-------------|
@@ -1130,7 +1032,45 @@ Access the dashboard at: **Cloud Console → Monitoring → Dashboards → OpenC
 | `cloudbuild_service_account` | Cloud Build service account email |
 | `secrets_configured` | List of Secret Manager secrets created (sensitive) |
 
+[Back to top](#table-of-contents)
+
+---
+
+## File Structure
+
+[Back to top](#table-of-contents)
+
+```
+openclaw-gke-kata/
+├── main.tf                    # Providers, backend, API enablement
+├── gke.tf                     # GKE Standard cluster with Kata node pool
+├── network.tf                 # VPC, subnet, Cloud NAT, firewalls
+├── iam.tf                     # Service accounts, Workload Identity, IAM
+├── storage.tf                 # Artifact Registry, Cloud Build, Secret Manager
+├── kubernetes.tf              # Namespace, deployments, PVCs, services
+├── logging.tf                 # Monitoring dashboard, alerts, log sink
+├── kata.tf                    # Kata Containers Helm release
+├── exec_vm.tf                 # Execution VM resources (optional)
+├── variables.tf               # Input variables
+├── outputs.tf                 # Output values
+├── terraform.tfvars           # Variable values (do not commit)
+├── terraform.tfvars.example   # Example variable values
+├── Dockerfile                 # OpenClaw container image
+├── openclaw.json.template     # OpenClaw config (rendered at startup)
+└── scripts/
+    ├── entrypoint.sh          # Container entrypoint (auto-approve + gateway)
+    ├── build_and_push.sh      # Cloud Build image build script
+    ├── linux_startup.sh       # Linux VM startup (node hosts via systemd)
+    └── windows_startup.ps1    # Windows VM startup (node hosts via Scheduled Tasks)
+```
+
+[Back to top](#table-of-contents)
+
+---
+
 ## Cleanup
+
+[Back to top](#table-of-contents)
 
 > **Note:** Cluster deletion protection is enabled. To destroy, first disable it:
 
@@ -1141,3 +1081,5 @@ terraform apply -var="deletion_protection=false" -target=google_container_cluste
 # Then destroy
 terraform destroy
 ```
+
+[Back to top](#table-of-contents)
