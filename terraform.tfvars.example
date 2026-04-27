@@ -35,6 +35,7 @@ model_fallbacks  = "[\"litellm/gemini-3.1-flash-lite-preview\"]"
 # GKE subnet and exec-VM subnet are added automatically.
 
 # master_authorized_cidrs = {
+#   "Cloud Shell"  = "34.80.66.100/32"
 #   "Office VPN"   = "203.0.113.0/24"
 #   "CI/CD runner" = "10.50.0.0/24"
 # }

@@ -83,6 +83,8 @@ resource "null_resource" "kubeconfig" {
 
 resource "google_project_service" "apis" {
   for_each = toset([
+    "cloudresourcemanager.googleapis.com",
+    "serviceusage.googleapis.com",
     "compute.googleapis.com",
     "container.googleapis.com", # Added for GKE
     "secretmanager.googleapis.com",
@@ -92,6 +94,7 @@ resource "google_project_service" "apis" {
     "iam.googleapis.com",
     "cloudbuild.googleapis.com",
     "containerscanning.googleapis.com",
+    "aiplatform.googleapis.com"
   ])
 
   project            = var.project_id

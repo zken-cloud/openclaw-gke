@@ -174,7 +174,7 @@ graph TD
 
 ### Kata Containers — VM-Level Sandboxing
 
-Every OpenClaw pod runs inside a [Kata Container](https://katacontainers.io/) providing full VM isolation. Kata spins up a lightweight VM per pod using nested virtualization on N2 nodes:
+Every OpenClaw pod runs inside a [Kata Container](https://katacontainers.io/) providing full VM isolation. Kata spins up a lightweight VM per pod using [nested virtualization](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/nested-virtualization) on N2 nodes:
 
 - **Full kernel isolation** — Each pod gets its own guest kernel. Even if OpenClaw executes malicious code, it cannot reach the host kernel.
 - **Stronger than gVisor** — Unlike syscall-filtering approaches, Kata provides a hardware-enforced VM boundary via KVM/QEMU.
@@ -248,49 +248,62 @@ This deployment sets `dangerouslyDisableDeviceAuth: true` — a deliberate choic
 - [kubectl](https://kubernetes.io/docs/tasks/tools/) installed
 - A GCP project with billing enabled
 
-### Step 1: Create the State Bucket
+### Step 1: Project Org Policy Update (Kata Containers)
+
+Kata Containers requires loading unsigned kernel modules for nested virtualization (kata-clh runtime). 
+
+Below commands require `roles/orgpolicy.policyAdmin` IAM role.
+```bash
+export PROJECT_ID="my-gcp-project"
+gcloud resource-manager org-policies disable-enforce compute.requireShieldedVm --project=$PROJECT_ID
+gcloud resource-manager org-policies disable-enforce compute.disableNestedVirtualization --project=$PROJECT_ID
+```
+
+### Step 2: Create the State Bucket
 
 ```bash
 export PROJECT_ID="my-gcp-project"
+export TF_STATE_BUCKET_REGION="asia-southeast1"
 
 # Create Terraform state bucket
-gsutil mb -p "$PROJECT_ID" -l asia-southeast1 "gs://${PROJECT_ID}-tf-state"
-gsutil versioning set on "gs://${PROJECT_ID}-tf-state"
+gsutil mb -p "$PROJECT_ID" -l $TF_STATE_BUCKET_REGION "gs://${PROJECT_ID}-openclaw-gke-tf-state"
+gsutil versioning set on "gs://${PROJECT_ID}-openclaw-gke-tf-state"
 ```
 
 [Back to top](#table-of-contents)
 
-### Step 2: Clone and Configure
+### Step 3: Clone and Configure
 
 ```bash
 git clone https://github.com/zken-cloud/openclaw-gke-kata.git
 cd openclaw-gke-kata
 ```
 
-Edit `terraform.tfvars`:
+Copy `terraform.tfvars.example` to `terraform.tfvars` and edit:
 
 ```hcl
 # Required
 project_id = "my-gcp-project"
 
-# Region
-region = "asia-southeast1"
-zone   = "asia-southeast1-a"
+# Target Region & Zone to deploy
+region = "us-central1"
+zone   = "us-central1-c"
 
-# Models
-openclaw_version = "latest"
-model_primary    = "litellm/gemini-3.1-pro-preview"
-model_fallbacks  = "[\"litellm/gemini-3.1-flash-lite-preview\"]"
-
-# Developers — each gets a dedicated pod and 10Gi PVC
+# Developers / OpenClaw Users -- each gets an isolated OpenClaw pod + PVC
 developers = {
   "alice" = { active = true }
   "bob"   = { active = true }
 }
 
-# Control plane access (add your IP/CIDR)
+# OpenClaw
+openclaw_version = "latest"
+model_primary    = "litellm/gemini-3.1-pro-preview"
+model_fallbacks  = "[\"litellm/gemini-3.1-flash-lite-preview\"]"
+
+# GKE Control plane access (add your IP/CIDR)
 master_authorized_cidrs = {
-  "My IP" = "YOUR_IP/32"
+  "My IP"   = "YOUR_IP/32"
+  "My CIDR" = "YOUR_SUBNET/24"
 }
 
 # Optional: Execution VMs (uncomment to enable)
@@ -312,10 +325,10 @@ export TF_VAR_brave_api_key=""       # optional
 
 [Back to top](#table-of-contents)
 
-### Step 3: Deploy
+### Step 4: Deploy
 
 ```bash
-terraform init -backend-config="bucket=${PROJECT_ID}-tf-state"
+terraform init -backend-config="bucket=${PROJECT_ID}-openclaw-gke-tf-state"
 terraform plan
 terraform apply
 ```
@@ -333,21 +346,30 @@ This will:
 
 Deployment takes approximately 15–20 minutes (GKE cluster creation is the bottleneck).
 
-[Back to top](#table-of-contents)
-
-### Step 4: Build and Push the Container Image
-
-> **Skip this step** if you set `sandbox_image` to a custom pre-built image in your `terraform.tfvars`.
-
-```bash
-export PROJECT_ID="my-gcp-project"
-export REGION="asia-southeast1"
-./scripts/build_and_push.sh
+Note: If you see this error while Terraform is running, your client host is likely on a different GKE context. 
+Get cluster credentials in Step 6 would give you the correct GKE context and the control plane IP for Terraform to conenct to.
+```
+│ Error: Post "https://<GKE Control Plane IP>/api/v1/namespaces": dial tcp <GKE Control Plane IP>: i/o timeout
+│ 
+│   with kubernetes_namespace.openclaw,
+│   on kubernetes.tf line 1, in resource "kubernetes_namespace" "openclaw":
+│    1: resource "kubernetes_namespace" "openclaw" {
+│ 
+╵
 ```
 
 [Back to top](#table-of-contents)
 
-### Step 5: Restart Pods
+### Step 5 (Optional): Build and Push the Container Image then Restart Pods.
+
+> **This step can be skipped** by default it uses the openclaw image built in the project Artifact Registry
+
+> **Only run this step** if you customise the image Dockerfile and want to redeploy.
+```bash
+export PROJECT_ID="my-gcp-project"
+export REGION="us-central1"
+./scripts/build_and_push.sh
+```
 
 ```bash
 kubectl rollout restart deployment -n openclaw -l component=brain
@@ -360,7 +382,7 @@ kubectl rollout restart deployment -n openclaw -l component=brain
 ```bash
 # Get cluster credentials
 gcloud container clusters get-credentials openclaw-cluster \
-  --region $(terraform output -raw gke_cluster_region 2>/dev/null || echo "asia-southeast1") \
+  --region $(terraform output -raw gke_cluster_region 2>/dev/null || echo $REGION) \
   --project $PROJECT_ID
 
 # Check pods are running
@@ -378,6 +400,21 @@ kubectl get pods -n openclaw -o jsonpath='{range .items[*]}{.metadata.name}{" ->
 # Verify non-root
 kubectl exec -n openclaw deployment/openclaw-brain-alice -- id
 # Expected: uid=10001(openclaw) gid=10001(openclaw)
+```
+#### Optional for running Kata Containers
+Confirm [nested virtualization is enabled](https://docs.cloud.google.com/compute/docs/instances/nested-virtualization/enabling#confirm_that_nested_virtualization_is_enabled_on_the_vm) on GKE Node
+
+```bash
+# Connect to the GKE Node VM instance
+gcloud compute ssh "my-gke-node-vm-name"
+
+# Verify nested virtualization is enabled
+grep -cw vmx /proc/cpuinfo
+```
+If nested virtualization is disabled, `openclaw-brain-alice` and `openclaw-brain-bob` deployment would fail in the GKE cluster with below error message:
+```
+openclaw-brain-alice, openclaw-brain-bob stuck at ContainerCreating
+Failed to create pod sandbox: rpc error: code = Unknown desc = failed to start sandbox "some-hex-number": failed to create containerd task: failed to create shim task: Could not create the sandbox resource controller failed to add any hypervisor device to devices cgroup	FailedCreatePodSandBox
 ```
 
 [Back to top](#table-of-contents)
@@ -432,7 +469,7 @@ Step-by-step guide to verify every feature after deployment.
 ```bash
 # Ensure you have cluster access
 gcloud container clusters get-credentials openclaw-cluster \
-  --region asia-southeast1 --project $PROJECT_ID
+  --region $REGION --project $PROJECT_ID
 
 # Verify pods are running
 kubectl get pods -n openclaw
@@ -444,7 +481,11 @@ kubectl get pods -n openclaw
 ### Test 1: LiteLLM Proxy Health
 
 ```bash
-kubectl exec -n openclaw deployment/litellm -- curl -s http://localhost:4000/health
+# liveness check
+kubectl exec -n openclaw deployment/litellm -- node -e "fetch('http://localhost:4000/health/liveness').then(r => r.text()).then(console.log)"
+
+# readiness check
+kubectl exec -n openclaw deployment/litellm -- node -e "fetch('http://localhost:4000/health/readiness').then(r => r.json()).then(console.log)"
 ```
 
 Expected: `{"status":"ok"}`
@@ -543,7 +584,7 @@ kubectl exec -n openclaw deployment/openclaw-brain-alice -- cat /tmp/secret.txt
 ```bash
 # Write a marker file to the PVC mount
 kubectl exec -n openclaw deployment/openclaw-brain-alice -- \
-  bash -c 'echo "persist-test" > /home/openclaw/.openclaw/marker.txt'
+  bash -c 'echo "persist-test" > /app/workspace/marker.txt'
 
 # Delete the pod (deployment recreates it)
 kubectl delete pod -n openclaw -l developer=alice
@@ -553,7 +594,7 @@ kubectl wait --for=condition=ready pod -n openclaw -l developer=alice --timeout=
 
 # Verify the file survived
 kubectl exec -n openclaw deployment/openclaw-brain-alice -- \
-  cat /home/openclaw/.openclaw/marker.txt
+  cat /app/workspace/marker.txt
 # Expected: "persist-test"
 ```
 
@@ -586,7 +627,7 @@ Expected:
 
 ```bash
 kubectl exec -n openclaw deployment/openclaw-brain-alice -- \
-  curl -s -o /dev/null -w '%{http_code}' https://www.google.com
+  node -e "fetch('https://www.google.com').then(r => console.log(r.status))"
 # Expected: 200 (Cloud NAT provides outbound access)
 ```
 
@@ -818,9 +859,13 @@ Build a pre-configured Windows Server golden image with OpenClaw, Node.js, and a
 ### Step 1: Create a Source VM
 
 ```bash
+# Set Region & Zone for Windows VM builder
+export REGION="us-central1"
+export ZONE="us-central1-c"
+
 gcloud compute instances create openclaw-win-builder \
   --project=$PROJECT_ID \
-  --zone=asia-southeast1-a \
+  --zone=$ZONE \
   --machine-type=e2-standard-4 \
   --image-project=windows-cloud \
   --image-family=windows-2022-core \
@@ -830,7 +875,7 @@ gcloud compute instances create openclaw-win-builder \
   --shielded-vtpm \
   --shielded-integrity-monitoring \
   --no-address \
-  --subnet=projects/$PROJECT_ID/regions/asia-southeast1/subnetworks/openclaw-vpc-windows-subnet
+  --subnet=projects/$PROJECT_ID/regions/$REGION/subnetworks/openclaw-vpc-windows-subnet
 ```
 
 [Back to top](#table-of-contents)
@@ -840,11 +885,11 @@ gcloud compute instances create openclaw-win-builder \
 ```bash
 # Set a Windows password
 gcloud compute reset-windows-password openclaw-win-builder \
-  --zone=asia-southeast1-a --quiet
+  --zone=$ZONE --quiet
 
 # Connect via IAP RDP tunnel
 gcloud compute start-iap-tunnel openclaw-win-builder 3389 \
-  --zone=asia-southeast1-a --local-host-port=localhost:33389
+  --zone=$ZONE --local-host-port=localhost:33389
 # Then RDP to localhost:33389
 ```
 
@@ -886,9 +931,9 @@ Wait for the VM to shut down, then:
 gcloud compute images create openclaw-windows-golden-v1 \
   --project=$PROJECT_ID \
   --source-disk=openclaw-win-builder \
-  --source-disk-zone=asia-southeast1-a \
+  --source-disk-zone=$ZONE \
   --family=openclaw-windows \
-  --storage-location=asia-southeast1 \
+  --storage-location=$REGION \
   --labels=app=openclaw,managed-by=terraform \
   --description="OpenClaw Windows golden image with Node.js 22 and OpenClaw pre-installed"
 ```
@@ -900,7 +945,7 @@ gcloud compute images create openclaw-windows-golden-v1 \
 ```bash
 # Delete the builder VM
 gcloud compute instances delete openclaw-win-builder \
-  --zone=asia-southeast1-a --quiet
+  --zone=$ZONE --quiet
 ```
 
 Update `terraform.tfvars` to use the golden image:
