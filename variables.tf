@@ -75,15 +75,34 @@ variable "gke_cluster_name" {
 }
 
 variable "gke_machine_type" {
-  description = "Machine type for GKE node pool. Must support nested virtualization (N2 series)."
+  description = "Machine type for the kata-pool node pool (Standard cluster only). Must support nested virtualization (N2 series). Not used in Autopilot mode."
   type        = string
   default     = "n2-standard-4"
 }
 
 variable "gke_node_count" {
-  description = "Number of nodes per zone in the GKE node pool."
+  description = "Number of nodes per zone in the kata-pool (Standard cluster only). Not used in Autopilot mode."
   type        = number
   default     = 1
+}
+
+variable "sandbox_runtime" {
+  description = <<-EOT
+    Sandbox runtime for OpenClaw brain pods. Determines the cluster mode:
+      "kata"   — GKE Standard cluster with kata-pool (N2 nodes, nested-virt,
+                 UBUNTU_CONTAINERD). Uses kata-clh RuntimeClass. Requires the
+                 kata-deploy Helm chart (installed automatically).
+      "gvisor" — GKE Autopilot cluster. Uses the built-in gVisor (runsc)
+                 RuntimeClass. No node pools or extra Helm charts needed.
+                 Autopilot manages all node provisioning automatically.
+  EOT
+  type        = string
+  default     = "kata"
+
+  validation {
+    condition     = contains(["kata", "gvisor"], var.sandbox_runtime)
+    error_message = "sandbox_runtime must be 'kata' or 'gvisor'."
+  }
 }
 
 # ──────────────────────────────────────────────────────────────────────────────

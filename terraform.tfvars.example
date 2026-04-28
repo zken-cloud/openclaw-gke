@@ -24,6 +24,13 @@ openclaw_version = "latest"
 model_primary    = "litellm/gemini-3.1-pro-preview"
 model_fallbacks  = "[\"litellm/gemini-3.1-flash-lite-preview\"]"
 
+# Sandbox runtime — choose one:
+#   "kata"   — GKE Standard cluster + kata-pool (N2 nodes, nested-virt, kata-clh RuntimeClass)
+#              Requires kata-deploy Helm chart (installed automatically by Terraform).
+#   "gvisor" — GKE Autopilot cluster. gVisor RuntimeClass available natively.
+#              No node pools, no Helm chart, no machine type configuration needed.
+sandbox_runtime = "kata"
+
 # Optional -- leave empty to auto-generate a 48-char hex token
 # gateway_auth_token = ""
 

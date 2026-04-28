@@ -54,6 +54,7 @@ provider "google" {
   region  = var.region
 }
 
+
 data "google_client_config" "default" {}
 
 provider "kubernetes" {
@@ -68,10 +69,13 @@ provider "helm" {
 
 # Refresh kubeconfig after cluster is created (for debugging/manual access)
 resource "null_resource" "kubeconfig" {
-  depends_on = [google_container_node_pool.kata_pool]
+  depends_on = [
+    google_container_node_pool.kata_pool,    # empty when sandbox_runtime = "gvisor" (count = 0)
+    google_container_cluster.autopilot,      # empty when sandbox_runtime = "kata"   (count = 0)
+  ]
 
   provisioner "local-exec" {
-    command = "gcloud container clusters get-credentials ${google_container_cluster.primary.name} --region ${var.region} --project ${var.project_id}"
+    command = "gcloud container clusters get-credentials ${local.cluster_name} --region ${var.region} --project ${var.project_id}"
   }
 }
 

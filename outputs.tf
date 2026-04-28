@@ -3,13 +3,13 @@
 ###############################################################################
 
 output "gke_cluster_name" {
-  description = "Name of the GKE Standard cluster."
-  value       = google_container_cluster.primary.name
+  description = "Name of the active GKE cluster (Standard for kata, Autopilot for gvisor)."
+  value       = local.cluster_name
 }
 
 output "gke_cluster_endpoint" {
-  description = "Endpoint for GKE Standard cluster."
-  value       = google_container_cluster.primary.endpoint
+  description = "Endpoint for the active GKE cluster (Standard for kata, Autopilot for gvisor)."
+  value       = one(concat(google_container_cluster.standard[*].endpoint, google_container_cluster.autopilot[*].endpoint))
 }
 
 output "exec_vms" {
