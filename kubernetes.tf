@@ -246,7 +246,10 @@ resource "kubernetes_deployment" "openclaw_brain" {
 
   wait_for_rollout = false
 
-  depends_on = [time_sleep.kata_ready, null_resource.build_openclaw_image]
+  depends_on = [
+    time_sleep.kata_ready,             # empty when sandbox_runtime = "gvisor" (count = 0)
+    null_resource.build_openclaw_image,
+  ]
 
   spec {
     replicas = each.value.active ? 1 : 0
@@ -270,7 +273,9 @@ resource "kubernetes_deployment" "openclaw_brain" {
 
       spec {
         service_account_name = kubernetes_service_account.openclaw_brain.metadata[0].name
-        runtime_class_name   = "kata-clh"
+        # sandbox_runtime = "kata"   → kata-clh (provided by kata-deploy Helm chart)
+        # sandbox_runtime = "gvisor" → gvisor   (provided by GKE Autopilot natively)
+        runtime_class_name   = var.sandbox_runtime == "kata" ? "kata-clh" : "gvisor"
 
         security_context {
           run_as_non_root = true

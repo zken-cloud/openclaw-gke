@@ -68,7 +68,8 @@ resource "google_service_account_iam_binding" "workload_identity_user" {
   role               = "roles/iam.workloadIdentityUser"
 
   members = [
-    "serviceAccount:${google_container_cluster.primary.workload_identity_config[0].workload_pool}[openclaw/openclaw-brain]"
+    # local.cluster_workload_pool resolves to the active cluster (standard or autopilot)
+    "serviceAccount:${local.cluster_workload_pool}[openclaw/openclaw-brain]"
   ]
 }
 

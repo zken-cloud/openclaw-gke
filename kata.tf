@@ -1,9 +1,12 @@
 # ──────────────────────────────────────────────────────────────────────────────
 # Kata Containers — installed via official kata-deploy Helm chart
 # Provides RuntimeClasses: kata-clh, kata-qemu, etc.
+# Only deployed when sandbox_runtime = "kata".
 # ──────────────────────────────────────────────────────────────────────────────
 
 resource "helm_release" "kata_deploy" {
+  count = var.sandbox_runtime == "kata" ? 1 : 0
+
   name       = "kata-deploy"
   repository = "oci://ghcr.io/kata-containers/kata-deploy-charts"
   chart      = "kata-deploy"
@@ -16,12 +19,14 @@ resource "helm_release" "kata_deploy" {
 
   depends_on = [
     null_resource.kubeconfig,
-    google_container_node_pool.kata_pool,
+    google_container_node_pool.kata_pool[0],
   ]
 }
 
 # Give kata-deploy DaemonSet time to configure containerd and restart it on all nodes
 resource "time_sleep" "kata_ready" {
-  depends_on      = [helm_release.kata_deploy]
+  count = var.sandbox_runtime == "kata" ? 1 : 0
+
+  depends_on      = [helm_release.kata_deploy[0]]
   create_duration = "30s"
 }

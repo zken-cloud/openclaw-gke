@@ -1,12 +1,13 @@
-# OpenClaw on GCP — Multi-Tenant GKE with Kata Containers
+# OpenClaw on GCP — Multi-Tenant GKE with Sandbox Isolation
 
-Deploy [OpenClaw](https://docs.openclaw.ai) on Google Cloud with GKE Standard, Kata Containers (VM-level isolation), and Vertex AI — fully managed by Terraform. Optionally add execution VMs (Windows/Linux) for OS-native command execution.
+Deploy [OpenClaw](https://docs.openclaw.ai) on Google Cloud with sandbox isolation (Kata Containers on GKE Standard, or gVisor on GKE Autopilot), and Vertex AI — fully managed by Terraform. Optionally add execution VMs (Windows/Linux) for OS-native command execution.
 
 ---
 
 ## Table of Contents
 
 - [Architecture](#architecture)
+- [Sandbox Runtime Options](#sandbox-runtime-options)
 - [Security Features](#security-features)
 - [Deployment Guide](#deployment-guide)
 - [End-to-End Testing](#end-to-end-testing)
@@ -36,7 +37,7 @@ graph TD
 
     subgraph GCP["GCP Project"]
 
-        subgraph GKE["GKE Standard — all pods sandboxed by Kata Containers"]
+        subgraph GKE["GKE (Standard: kata-clh  |  Autopilot: gvisor)"]
             subgraph NS["Namespace: openclaw"]
 
                 subgraph PodA["Pod: openclaw-brain-alice"]
@@ -103,7 +104,7 @@ graph TD
 
     subgraph GCP["GCP Project"]
 
-        subgraph GKE["GKE Standard — Kata Containers"]
+        subgraph GKE["GKE (Standard: kata-clh  |  Autopilot: gvisor)"]
             subgraph NS["Namespace: openclaw"]
                 PodA["Pod: openclaw-brain-alice\n(gateway :18789)"]
                 PodB["Pod: openclaw-brain-bob\n(gateway :18789)"]
@@ -154,7 +155,8 @@ graph TD
 
 | Component | Purpose |
 |-----------|---------|
-| **GKE Standard + Kata** | Managed Kubernetes with VM-level isolation via Kata Containers (nested virtualization on N2 nodes) |
+| **GKE Standard + Kata** | Managed Kubernetes (Standard mode) with VM-level pod isolation via Kata Containers (`sandbox_runtime = "kata"`) |
+| **GKE Autopilot + gVisor** | Fully-managed Kubernetes (Autopilot mode) with user-space kernel isolation via gVisor (`sandbox_runtime = "gvisor"`) |
 | **LiteLLM Proxy** | Routes LLM requests to Vertex AI Gemini models via Workload Identity — no API keys |
 | **Workload Identity** | Maps K8s ServiceAccount to GCP SA — no service account keys stored anywhere |
 | **Per-Developer Pods** | Each developer gets an isolated pod + PVC with their own OpenClaw gateway instance |
@@ -168,17 +170,72 @@ graph TD
 
 ---
 
+## Sandbox Runtime Options
+
+[Back to top](#table-of-contents)
+
+OpenClaw supports two pod sandbox runtimes, selectable via the `sandbox_runtime` variable. **Each runtime deploys a different GKE cluster mode:**
+
+| | `kata` (default) | `gvisor` |
+|---|---|---|
+| **GKE cluster mode** | **Standard** | **Autopilot** |
+| **Node pool** | `kata-pool` (user-managed) | Managed by Autopilot |
+| **RuntimeClass** | `kata-clh` | `gvisor` |
+| **Isolation model** | Lightweight VM per pod (KVM/QEMU) | User-space kernel (syscall interception) |
+| **Machine type** | N2 series (nested virtualization required) | Managed by Autopilot |
+| **Node image** | `UBUNTU_CONTAINERD` | Managed by Autopilot |
+| **Extra setup** | kata-deploy Helm chart + DaemonSet | None (Autopilot supports gVisor natively) |
+| **Secure Boot** | Disabled (unsigned kernel modules) | Enabled |
+| **Overhead** | ~256 MB RAM + VM startup latency | Lower overhead, no VM boot |
+
+### Choosing a Runtime
+
+**Use `kata`** when you need the strongest isolation boundary (hardware-enforced VM per pod). Required if you are running untrusted code that must be fully kernel-isolated.
+
+**Use `gvisor`** when you want simpler setup, fully managed nodes, and can accept a user-space syscall-filtering boundary. Autopilot manages all node provisioning automatically — no node pools, machine types, or Helm charts to configure.
+
+### Configuring the Runtime
+
+In `terraform.tfvars`:
+
+```hcl
+# Option 1: Kata Containers — GKE Standard cluster (default)
+sandbox_runtime = "kata"
+
+# Option 2: gVisor — GKE Autopilot cluster
+sandbox_runtime = "gvisor"
+```
+
+Only one cluster is provisioned at a time. Switching runtimes on an existing deployment requires destroying and re-creating the cluster — plan for downtime accordingly.
+
+[Back to top](#table-of-contents)
+
+---
+
 ## Security Features
 
 [Back to top](#table-of-contents)
 
-### Kata Containers — VM-Level Sandboxing
+### Sandbox Isolation
 
-Every OpenClaw pod runs inside a [Kata Container](https://katacontainers.io/) providing full VM isolation. Kata spins up a lightweight VM per pod using [nested virtualization](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/nested-virtualization) on N2 nodes:
+Every OpenClaw brain pod runs inside a sandbox runtime — either Kata Containers (Standard cluster) or gVisor (Autopilot cluster) — selected at deploy time via `sandbox_runtime`.
+
+#### Kata Containers (`sandbox_runtime = "kata"`) — GKE Standard
+
+Every pod runs inside a [Kata Container](https://katacontainers.io/) providing full VM isolation via [nested virtualization](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/nested-virtualization) on N2 nodes:
 
 - **Full kernel isolation** — Each pod gets its own guest kernel. Even if OpenClaw executes malicious code, it cannot reach the host kernel.
-- **Stronger than gVisor** — Unlike syscall-filtering approaches, Kata provides a hardware-enforced VM boundary via KVM/QEMU.
-- **Explicit opt-in** — Pods use `runtimeClassName: kata-clh`, configured by Terraform. No accidental fallback to the default runtime.
+- **Hardware-enforced boundary** — KVM/QEMU provides a true VM boundary, stronger than syscall filtering.
+- **Explicit opt-in** — Pods use `runtimeClassName: kata-clh`, installed via the kata-deploy Helm chart.
+
+#### gVisor (`sandbox_runtime = "gvisor"`) — GKE Autopilot
+
+Every pod runs under [gVisor](https://gvisor.dev/) on a fully-managed GKE Autopilot cluster:
+
+- **Syscall interception** — The `runsc` runtime intercepts all Linux syscalls before they reach the host kernel, significantly reducing the attack surface.
+- **No VM overhead** — gVisor runs in user-space; no VM boot, lower memory overhead (~50–80 MB vs ~256 MB for Kata).
+- **Zero node management** — GKE Autopilot provisions and manages all nodes automatically. No node pools, machine types, or OS images to configure.
+- **Native Autopilot support** — Pods use `runtimeClassName: gvisor`; Autopilot automatically schedules them on gVisor-capable nodes. No Helm chart needed.
 
 ### Zero API Keys in the Cluster
 
@@ -248,16 +305,23 @@ This deployment sets `dangerouslyDisableDeviceAuth: true` — a deliberate choic
 - [kubectl](https://kubernetes.io/docs/tasks/tools/) installed
 - A GCP project with billing enabled
 
-### Step 1: Project Org Policy Update (Kata Containers)
+### Step 1: Project Org Policy Update
 
-Kata Containers requires loading unsigned kernel modules for nested virtualization (kata-clh runtime). 
+#### Kata Containers only (`sandbox_runtime = "kata"`)
 
-Below commands require `roles/orgpolicy.policyAdmin` IAM role.
+Kata requires loading unsigned kernel modules for nested virtualization. These org policies must be relaxed:
+
+> Requires `roles/orgpolicy.policyAdmin` IAM role.
+
 ```bash
 export PROJECT_ID="my-gcp-project"
 gcloud resource-manager org-policies disable-enforce compute.requireShieldedVm --project=$PROJECT_ID
 gcloud resource-manager org-policies disable-enforce compute.disableNestedVirtualization --project=$PROJECT_ID
 ```
+
+#### gVisor (`sandbox_runtime = "gvisor"`)
+
+No org policy changes required. GKE Autopilot is a fully managed GKE feature — skip this step entirely.
 
 ### Step 2: Create the State Bucket
 
@@ -300,6 +364,11 @@ openclaw_version = "latest"
 model_primary    = "litellm/gemini-3.1-pro-preview"
 model_fallbacks  = "[\"litellm/gemini-3.1-flash-lite-preview\"]"
 
+# Sandbox runtime — choose one:
+#   "kata"   — GKE Standard cluster, kata-pool (N2 nodes, kata-clh RuntimeClass, kata-deploy Helm chart)
+#   "gvisor" — GKE Autopilot cluster, gVisor RuntimeClass, no node pools or Helm chart needed
+sandbox_runtime = "kata"
+
 # GKE Control plane access (add your IP/CIDR)
 master_authorized_cidrs = {
   "My IP"   = "YOUR_IP/32"
@@ -315,6 +384,12 @@ master_authorized_cidrs = {
 # Alerts (optional)
 alert_email = "you@example.com"
 ```
+
+Getting the client external IP for GKE Control plane access (`master_authorized_cidrs`)
+```bash
+curl ifconfig.me
+```
+
 
 Set sensitive variables via environment:
 
@@ -336,8 +411,10 @@ terraform apply
 This will:
 1. Enable all required GCP APIs
 2. Create VPC, subnet, Cloud NAT, firewall rules
-3. Create GKE Standard cluster with Kata-enabled node pool (N2, nested virtualization)
-4. Install Kata Containers via Helm
+3. Create a GKE cluster based on the selected runtime:
+   - **`kata`** — GKE **Standard** cluster with N2 nodes, nested virtualization, and kata-deploy Helm chart
+   - **`gvisor`** — GKE **Autopilot** cluster; gVisor RuntimeClass available natively, no node pools to manage
+4. *(kata only)* Install Kata Containers via the kata-deploy Helm chart
 5. Deploy per-developer OpenClaw pods, PVCs, and ILB services
 6. Deploy LiteLLM proxy with Workload Identity
 7. Create Secret Manager secrets and IAM bindings
@@ -346,16 +423,31 @@ This will:
 
 Deployment takes approximately 15–20 minutes (GKE cluster creation is the bottleneck).
 
-Note: If you see this error while Terraform is running, your client host is likely on a different GKE context. 
+Note 1: If you see this error while Terraform is running, your client host is likely on a different GKE context. 
 Get cluster credentials in Step 6 would give you the correct GKE context and the control plane IP for Terraform to conenct to.
 ```
-│ Error: Post "https://<GKE Control Plane IP>/api/v1/namespaces": dial tcp <GKE Control Plane IP>: i/o timeout
+│ Error: Post "https://<Invalid GKE Control Plane IP>/api/v1/namespaces": dial tcp <Invalid GKE Control Plane IP>: i/o timeout
 │ 
 │   with kubernetes_namespace.openclaw,
 │   on kubernetes.tf line 1, in resource "kubernetes_namespace" "openclaw":
 │    1: resource "kubernetes_namespace" "openclaw" {
 │ 
 ╵
+```
+
+Note 2: Sometimes there is race condition when executing the container image build while the IAM permission is propagating in the background. Run `terraform apply` once again to continue.
+```
+ Error: local-exec provisioner error
+│ 
+│   with null_resource.build_openclaw_image,
+│   on storage.tf line 77, in resource "null_resource" "build_openclaw_image":
+│   77:   provisioner "local-exec" {
+│ 
+│ Error running command 'bash ./scripts/build_and_push.sh': exit status 1. Output: Building and pushing image using Cloud Build...
+│ Creating temporary archive of 100 file(s) totalling 395.5 KiB before compression.
+│ Uploading tarball of [.] to [gs://<PROJECT_ID>/source/<hex number>.tgz]
+│ ERROR: (gcloud.builds.submit) INVALID_ARGUMENT: could not resolve source: googleapi: Error 403: openclaw-cloudbuild@<PROJECT_ID>.iam.gserviceaccount.com does not have
+│ storage.objects.get access to the Google Cloud Storage object. Permission 'storage.objects.get' denied on resource (or it may not exist)., forbidden
 ```
 
 [Back to top](#table-of-contents)
@@ -381,6 +473,8 @@ kubectl rollout restart deployment -n openclaw -l component=brain
 
 ```bash
 # Get cluster credentials
+export REGION="us-central1"
+
 gcloud container clusters get-credentials openclaw-cluster \
   --region $(terraform output -raw gke_cluster_region 2>/dev/null || echo $REGION) \
   --project $PROJECT_ID
@@ -394,15 +488,19 @@ kubectl get pods -n openclaw
 # openclaw-brain-alice-xxxxx              1/1     Running   5m
 # openclaw-brain-bob-xxxxx                1/1     Running   5m
 
-# Verify Kata runtime is active
+# Verify sandbox runtime is active
 kubectl get pods -n openclaw -o jsonpath='{range .items[*]}{.metadata.name}{" -> "}{.spec.runtimeClassName}{"\n"}{end}'
+# kata:   openclaw-brain-alice -> kata-clh
+# gvisor: openclaw-brain-alice -> gvisor
 
 # Verify non-root
 kubectl exec -n openclaw deployment/openclaw-brain-alice -- id
 # Expected: uid=10001(openclaw) gid=10001(openclaw)
 ```
-#### Optional for running Kata Containers
-Confirm [nested virtualization is enabled](https://docs.cloud.google.com/compute/docs/instances/nested-virtualization/enabling#confirm_that_nested_virtualization_is_enabled_on_the_vm) on GKE Node
+
+#### Optional: Kata Containers — verify nested virtualization
+
+Confirm [nested virtualization is enabled](https://docs.cloud.google.com/compute/docs/instances/nested-virtualization/enabling#confirm_that_nested_virtualization_is_enabled_on_the_vm) on GKE Node:
 
 ```bash
 # Connect to the GKE Node VM instance
@@ -411,10 +509,22 @@ gcloud compute ssh "my-gke-node-vm-name"
 # Verify nested virtualization is enabled
 grep -cw vmx /proc/cpuinfo
 ```
-If nested virtualization is disabled, `openclaw-brain-alice` and `openclaw-brain-bob` deployment would fail in the GKE cluster with below error message:
+
+If nested virtualization is disabled, brain pods will fail with:
 ```
 openclaw-brain-alice, openclaw-brain-bob stuck at ContainerCreating
 Failed to create pod sandbox: rpc error: code = Unknown desc = failed to start sandbox "some-hex-number": failed to create containerd task: failed to create shim task: Could not create the sandbox resource controller failed to add any hypervisor device to devices cgroup	FailedCreatePodSandBox
+```
+
+#### Optional: gVisor — verify RuntimeClass (Autopilot)
+
+```bash
+# Confirm the gvisor RuntimeClass exists (registered automatically by Autopilot)
+kubectl get runtimeclass gvisor
+
+# Verify pod is using gVisor
+kubectl get pods -n openclaw -o jsonpath='{range .items[*]}{.metadata.name}{" -> "}{.spec.runtimeClassName}{"\n"}{end}'
+# Expected: openclaw-brain-alice -> gvisor
 ```
 
 [Back to top](#table-of-contents)
@@ -492,16 +602,21 @@ Expected: `{"status":"ok"}`
 
 [Back to top](#table-of-contents)
 
-### Test 2: Kata Container Verification
+### Test 2: Sandbox Runtime Verification
 
 ```bash
-# Verify runtime class exists
+# Verify RuntimeClass exists
+# kata:
 kubectl get runtimeclass kata-clh
+# gvisor:
+kubectl get runtimeclass gvisor
 
-# Verify pods use Kata
+# Verify pods use the configured sandbox
 kubectl get pods -n openclaw -o jsonpath='{range .items[*]}{.metadata.name}{" -> "}{.spec.runtimeClassName}{"\n"}{end}'
+# kata:   openclaw-brain-alice -> kata-clh
+# gvisor: openclaw-brain-alice -> gvisor
 
-# Verify kernel isolation (dmesg should be blocked)
+# Verify kernel isolation (dmesg should be blocked under both runtimes)
 kubectl exec -n openclaw deployment/openclaw-brain-alice -- dmesg 2>&1 | head -5
 # Expected: "dmesg: read kernel buffer failed: Operation not permitted"
 ```
@@ -1070,8 +1185,9 @@ Access at: **Cloud Console → Monitoring → Dashboards → OpenClaw Operations
 | `gke_pods_cidr` | No | `10.100.0.0/16` | Secondary CIDR for pods |
 | `gke_services_cidr` | No | `10.101.0.0/16` | Secondary CIDR for services |
 | `gke_cluster_name` | No | `openclaw-cluster` | GKE cluster name |
-| `gke_machine_type` | No | `n2-standard-4` | GKE node machine type (must support nested virt) |
+| `gke_machine_type` | No | `n2-standard-4` | GKE node machine type. N2 required for Kata; any type for gVisor |
 | `gke_node_count` | No | `1` | Nodes per zone |
+| `sandbox_runtime` | No | `kata` | Sandbox runtime: `"kata"` (kata-pool, kata-clh) or `"gvisor"` (gvisor-pool, GKE Sandbox) |
 | **Execution VMs** | | | |
 | `exec_vms` | No | `{}` | Map of execution VMs to deploy |
 | `exec_vm_subnet_cidr` | No | `10.20.0.0/24` | VM subnet CIDR |
@@ -1118,17 +1234,17 @@ Access at: **Cloud Console → Monitoring → Dashboards → OpenClaw Operations
 [Back to top](#table-of-contents)
 
 ```
-openclaw-gke-kata/
+openclaw-gke/
 ├── main.tf                    # Providers, backend, API enablement
-├── gke.tf                     # GKE Standard cluster with Kata node pool
+├── gke.tf                     # GKE cluster + kata-pool / gvisor-pool (conditional)
 ├── network.tf                 # VPC, subnet, Cloud NAT, firewalls
 ├── iam.tf                     # Service accounts, Workload Identity, IAM
 ├── storage.tf                 # Artifact Registry, Cloud Build, Secret Manager
 ├── kubernetes.tf              # Namespace, deployments, PVCs, services
 ├── logging.tf                 # Monitoring dashboard, alerts, log sink
-├── kata.tf                    # Kata Containers Helm release
+├── kata.tf                    # Kata Containers Helm release (kata only)
 ├── exec_vm.tf                 # Execution VM resources (optional)
-├── variables.tf               # Input variables
+├── variables.tf               # Input variables (incl. sandbox_runtime)
 ├── outputs.tf                 # Output values
 ├── terraform.tfvars           # Variable values (do not commit)
 ├── terraform.tfvars.example   # Example variable values
