@@ -1,8 +1,14 @@
 {
+  "env": {
+    "GOOGLE_CLOUD_PROJECT": "${VERTEXAI_PROJECT}",
+    "GOOGLE_CLOUD_LOCATION": "global",
+    "GOOGLE_VERTEX_BASE_URL": "https://aiplatform.googleapis.com/"
+  },
+
   "gateway": {
     "port": 18789,
     "mode": "local",
-    "bind": "lan",
+    "bind": "${GATEWAY_BIND}",
     "auth": {
       "mode": "token",
       "token": "${GATEWAY_AUTH_TOKEN}"

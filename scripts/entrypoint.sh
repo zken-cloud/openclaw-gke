@@ -7,13 +7,19 @@ export MODEL_PRIMARY="${MODEL_PRIMARY:-litellm/gemini-3.1-pro-preview}"
 export MODEL_FALLBACKS="${MODEL_FALLBACKS:-[\"litellm/gemini-3.1-flash-lite-preview\"]}"
 export GATEWAY_AUTH_TOKEN="${GATEWAY_AUTH_TOKEN:-}"
 export LITELLM_MASTER_KEY="${LITELLM_MASTER_KEY:-}"
+export GATEWAY_BIND="${GATEWAY_BIND:-loopback}"
 
-envsubst '$MODEL_PRIMARY,$MODEL_FALLBACKS,$GATEWAY_AUTH_TOKEN,$LITELLM_MASTER_KEY' < /app/openclaw.json.template > /app/openclaw.json
+envsubst '$MODEL_PRIMARY,$MODEL_FALLBACKS,$GATEWAY_AUTH_TOKEN,$LITELLM_MASTER_KEY,$GATEWAY_BIND' < /app/openclaw.json.template > /app/openclaw.json
 
 # Use persistent state dir on PVC so pairings survive pod restarts
 STATE_DIR="${OPENCLAW_STATE_DIR:-$HOME/.openclaw}"
 umask 077
 mkdir -p "$STATE_DIR"
+
+# Create compile cache directory for NODE_COMPILE_CACHE (Node.js v22.8+)
+if [ -n "$NODE_COMPILE_CACHE" ]; then
+  mkdir -p "$NODE_COMPILE_CACHE"
+fi
 
 # Merge template with existing config, preserving user-managed keys (e.g. channels)
 if [ -f "$STATE_DIR/openclaw.json" ]; then
@@ -27,13 +33,17 @@ else
   cp /app/openclaw.json "$STATE_DIR/openclaw.json"
 fi
 
-# Safety check: gateway.bind MUST be "lan" for ILB and node host connectivity.
+# Safety check: gateway.bind must match exec VM deployment status.
+# - With exec VMs (EXEC_VMS_ENABLED=true): MUST be "lan" for ILB and node host connectivity.
+# - Without exec VMs (EXEC_VMS_ENABLED=false): SHOULD be "loopback" for better security.
 # "auto" resolves to loopback-only which breaks kube-proxy forwarding.
 # "all" is not a valid OpenClaw value and causes CrashLoopBackOff.
 BIND_VALUE=$(jq -r '.gateway.bind // "missing"' "$STATE_DIR/openclaw.json")
-if [ "$BIND_VALUE" != "lan" ]; then
-  echo "FATAL: gateway.bind is '$BIND_VALUE', must be 'lan' for ILB connectivity. Fixing."
-  jq '.gateway.bind = "lan"' "$STATE_DIR/openclaw.json" > "$STATE_DIR/openclaw.json.tmp" \
+EXPECTED_BIND="${GATEWAY_BIND:-loopback}"
+
+if [ "$BIND_VALUE" != "$EXPECTED_BIND" ]; then
+  echo "WARN: gateway.bind is '$BIND_VALUE', expected '$EXPECTED_BIND'. Fixing."
+  jq --arg bind "$EXPECTED_BIND" '.gateway.bind = $bind' "$STATE_DIR/openclaw.json" > "$STATE_DIR/openclaw.json.tmp" \
     && mv "$STATE_DIR/openclaw.json.tmp" "$STATE_DIR/openclaw.json"
 fi
 
@@ -49,6 +59,14 @@ if [ ! -f "$STATE_DIR/exec-approvals.json" ] || [ "$(jq -r '.defaults.security /
 {"version":1,"defaults":{"security":"full","ask":"off","askFallback":"full"},"agents":{"main":{"security":"full","ask":"off"}}}
 EOFEA
   fi
+fi
+
+# Pre-seed auth-profiles.json for google-vertex to use ADC (Application Default Credentials)
+mkdir -p "$STATE_DIR/agents/main/agent"
+if [ ! -f "$STATE_DIR/agents/main/agent/auth-profiles.json" ]; then
+  cat > "$STATE_DIR/agents/main/agent/auth-profiles.json" << 'EOFAUTH'
+{"google-vertex":{"authMode":"adc"}}
+EOFAUTH
 fi
 
 # OpenClaw 2026.4.x blocks symlink traversal for security.

@@ -73,6 +73,8 @@ resource "kubernetes_config_map" "litellm_config" {
             model           = "vertex_ai/gemini-3.1-pro-preview"
             vertex_project  = var.project_id
             vertex_location = "global"
+            timeout         = 120  # 2 minutes per request
+            num_retries     = 2    # Retry failed requests twice
           }
         },
         {
@@ -81,12 +83,18 @@ resource "kubernetes_config_map" "litellm_config" {
             model           = "vertex_ai/gemini-3.1-flash-lite-preview"
             vertex_project  = var.project_id
             vertex_location = "global"
+            timeout         = 120  # 2 minutes per request
+            num_retries     = 2    # Retry failed requests twice
           }
         }
       ]
       general_settings = {
         # master_key provided via LITELLM_MASTER_KEY env var from K8s secret
-        master_key = "os.environ/LITELLM_MASTER_KEY"
+        master_key         = "os.environ/LITELLM_MASTER_KEY"
+        request_timeout    = 300   # Global timeout: 5 minutes for slow models
+        num_retries        = 2     # Retry on network errors
+        allowed_fails      = 3     # Circuit breaker: allow 3 failures before marking unhealthy
+        cooldown_time      = 10    # Wait 10s before retrying failed endpoint
       }
     })
   }
@@ -129,7 +137,8 @@ resource "kubernetes_deployment" "litellm" {
   wait_for_rollout = false
 
   spec {
-    replicas = 1
+    # Replica count managed by HPA (kubernetes_horizontal_pod_autoscaler_v2.litellm)
+    # replicas = 1
 
     selector {
       match_labels = {
@@ -148,6 +157,23 @@ resource "kubernetes_deployment" "litellm" {
 
       spec {
         service_account_name = kubernetes_service_account.openclaw_brain.metadata[0].name
+
+        # DNS configuration for better resolution reliability and caching
+        dns_policy = "ClusterFirst"
+        dns_config {
+          option {
+            name  = "ndots"
+            value = "2"  # Reduce DNS search domain attempts
+          }
+          option {
+            name  = "timeout"
+            value = "5"  # DNS query timeout in seconds
+          }
+          option {
+            name  = "attempts"
+            value = "3"  # Retry failed DNS queries
+          }
+        }
 
         security_context {
           run_as_non_root = true
@@ -168,7 +194,7 @@ resource "kubernetes_deployment" "litellm" {
           resources {
             requests = {
               cpu    = "100m"
-              memory = "512Mi"
+              memory = "850Mi"  # Increased from 512Mi to match base usage (~800Mi)
             }
             limits = {
               cpu    = "500m"
@@ -184,6 +210,18 @@ resource "kubernetes_deployment" "litellm" {
                 key  = "key"
               }
             }
+          }
+
+          # Logging and debugging
+          env {
+            name  = "LITELLM_LOG"
+            value = "INFO"
+          }
+
+          # Connection pooling and DNS caching for better network resilience
+          env {
+            name  = "LITELLM_DROP_PARAMS"
+            value = "false"
           }
 
           volume_mount {
@@ -224,6 +262,70 @@ resource "kubernetes_service" "litellm" {
     port {
       port        = 4000
       target_port = 4000
+    }
+  }
+}
+
+# Horizontal Pod Autoscaler for LiteLLM
+resource "kubernetes_horizontal_pod_autoscaler_v2" "litellm" {
+  metadata {
+    name      = "litellm"
+    namespace = kubernetes_namespace.openclaw.metadata[0].name
+  }
+
+  spec {
+    scale_target_ref {
+      api_version = "apps/v1"
+      kind        = "Deployment"
+      name        = kubernetes_deployment.litellm.metadata[0].name
+    }
+
+    min_replicas = 1
+    max_replicas = 5  # For 50 OpenClaw pods: scale 1-5 LiteLLM replicas
+
+    # Scale based on CPU usage
+    metric {
+      type = "Resource"
+      resource {
+        name = "cpu"
+        target {
+          type                = "Utilization"
+          average_utilization = 70  # Scale up when CPU >70%
+        }
+      }
+    }
+
+    # Scale based on memory usage
+    metric {
+      type = "Resource"
+      resource {
+        name = "memory"
+        target {
+          type                = "Utilization"
+          average_utilization = 90  # Scale up when memory >90% (LiteLLM base usage ~90%)
+        }
+      }
+    }
+
+    behavior {
+      scale_up {
+        stabilization_window_seconds = 60  # Wait 60s before scaling up again
+        select_policy                = "Max"
+        policy {
+          type           = "Percent"
+          value          = 100  # Double replicas at a time
+          period_seconds = 60
+        }
+      }
+      scale_down {
+        stabilization_window_seconds = 300  # Wait 5min before scaling down
+        select_policy                = "Max"
+        policy {
+          type           = "Pods"
+          value          = 1  # Remove 1 pod at a time
+          period_seconds = 60
+        }
+      }
     }
   }
 }
@@ -273,7 +375,24 @@ resource "kubernetes_deployment" "openclaw_brain" {
         service_account_name = kubernetes_service_account.openclaw_brain.metadata[0].name
         # sandbox_runtime = "kata"   → kata-clh (provided by kata-deploy Helm chart)
         # sandbox_runtime = "gvisor" → gvisor   (provided by GKE Autopilot natively)
-        runtime_class_name   = var.sandbox_runtime == "kata" ? "kata-clh" : "gvisor"
+        runtime_class_name = var.sandbox_runtime == "kata" ? "kata-clh" : "gvisor"
+
+        # DNS configuration for better resolution reliability and caching
+        dns_policy = "ClusterFirst"
+        dns_config {
+          option {
+            name  = "ndots"
+            value = "2"  # Reduce DNS search domain attempts
+          }
+          option {
+            name  = "timeout"
+            value = "5"  # DNS query timeout in seconds
+          }
+          option {
+            name  = "attempts"
+            value = "3"  # Retry failed DNS queries
+          }
+        }
 
         security_context {
           run_as_non_root = true
@@ -305,6 +424,16 @@ resource "kubernetes_deployment" "openclaw_brain" {
             name  = "OPENCLAW_STATE_DIR"
             value = "/app/workspace/.openclaw-state"
           }
+          # Disable internal respawn - let Kubernetes handle pod restarts
+          env {
+            name  = "OPENCLAW_NO_RESPAWN"
+            value = "1"
+          }
+          # Enable Node.js compile cache for faster CLI invocations
+          env {
+            name  = "NODE_COMPILE_CACHE"
+            value = "/app/workspace/.openclaw-state/compile-cache"
+          }
           # Kata VM overhead causes the default 10s WSS handshake to time out.
           # Both gateway (server) and CLI (client) read this env var.
           env {
@@ -332,7 +461,11 @@ resource "kubernetes_deployment" "openclaw_brain" {
           }
           env {
             name  = "VERTEXAI_LOCATION"
-            value = var.region
+            value = "global"
+          }
+          env {
+            name  = "GOOGLE_VERTEX_BASE_URL"
+            value = "https://aiplatform.googleapis.com/"
           }
           env {
             name = "GATEWAY_AUTH_TOKEN"
@@ -355,6 +488,11 @@ resource "kubernetes_deployment" "openclaw_brain" {
           env {
             name  = "EXEC_VMS_ENABLED"
             value = local.exec_vms_enabled ? "true" : "false"
+          }
+          # Gateway bind mode: "lan" when exec VMs need network access, "loopback" otherwise
+          env {
+            name  = "GATEWAY_BIND"
+            value = local.exec_vms_enabled ? "lan" : "loopback"
           }
           volume_mount {
             name       = "workspace"
