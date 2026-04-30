@@ -87,6 +87,16 @@ if [ -d /app/workspace-seed ]; then
   fi
 fi
 
+# Cleanup old plugin-runtime-deps to prevent event loop blocking
+# OpenClaw downloads plugin deps per version, but old versions accumulate on the PVC.
+# Scanning 1GB+ of old node_modules can block the event loop for 20-40 seconds.
+OPENCLAW_VERSION=$(node -e "console.log(require('/usr/local/lib/node_modules/openclaw/package.json').version)" 2>/dev/null || echo "unknown")
+if [ "$OPENCLAW_VERSION" != "unknown" ] && [ -d "$STATE_DIR/plugin-runtime-deps" ]; then
+  # Remove any plugin-runtime-deps directories that don't match current version
+  find "$STATE_DIR/plugin-runtime-deps" -maxdepth 1 -type d -name "openclaw-*" ! -name "openclaw-${OPENCLAW_VERSION}-*" -exec rm -rf {} + 2>/dev/null || true
+  echo "[entrypoint] Cleaned up old plugin runtime deps (current version: $OPENCLAW_VERSION)"
+fi
+
 # Start OpenClaw
 GLOBAL_ROOT=$(npm root -g)
 
