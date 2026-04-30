@@ -115,7 +115,7 @@ resource "kubernetes_persistent_volume_claim" "openclaw_pvc" {
   }
 }
 
-# Shared LiteLLM proxy deployment (runs under Kata)
+# Shared LiteLLM proxy deployment
 resource "kubernetes_deployment" "litellm" {
   metadata {
     name      = "litellm"
@@ -148,8 +148,6 @@ resource "kubernetes_deployment" "litellm" {
 
       spec {
         service_account_name = kubernetes_service_account.openclaw_brain.metadata[0].name
-        # LiteLLM is a simple HTTP proxy — no user code execution, no need for VM-level isolation.
-        # Removing Kata reduces memory by ~256MB and eliminates Kata VM I/O overhead.
 
         security_context {
           run_as_non_root = true
@@ -354,7 +352,10 @@ resource "kubernetes_deployment" "openclaw_brain" {
               }
             }
           }
-
+          env {
+            name  = "EXEC_VMS_ENABLED"
+            value = local.exec_vms_enabled ? "true" : "false"
+          }
           volume_mount {
             name       = "workspace"
             mount_path = "/app/workspace"

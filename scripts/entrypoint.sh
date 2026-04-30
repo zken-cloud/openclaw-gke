@@ -73,29 +73,34 @@ fi
 GLOBAL_ROOT=$(npm root -g)
 
 # Background: auto-approve pending node-host device pairings.
-# Checks every 15s for pending requests with role=node and approves them.
-# This enables fully automated pairing without manual intervention.
-(
-  sleep 30  # wait for gateway to be ready
-  while true; do
-    # List pending requests, extract request IDs for node-role devices
-    pending=$(node "$GLOBAL_ROOT/openclaw/dist/entry.js" devices list --json --timeout 60000 2>/dev/null || echo '{}')
-    echo "$pending" | jq -r '.pending[]? | select(.role == "node") | .requestId' 2>/dev/null | while read -r req_id; do
-      if [ -n "$req_id" ]; then
-        echo "[auto-pair] approving node device: $req_id"
-        node "$GLOBAL_ROOT/openclaw/dist/entry.js" devices approve "$req_id" --timeout 60000 2>/dev/null || true
-      fi
-    done
+# Only enabled when execution VMs are deployed (EXEC_VMS_ENABLED=true).
+# This background loop causes event loop blocking, so it's disabled when not needed.
+if [ "${EXEC_VMS_ENABLED:-false}" = "true" ]; then
+  echo "[entrypoint] Starting auto-pair background loop (exec VMs enabled)"
+  (
+    sleep 30  # wait for gateway to be ready
+    while true; do
+      # List pending requests, extract request IDs for node-role devices
+      pending=$(node "$GLOBAL_ROOT/openclaw/dist/entry.js" devices list --json --timeout 60000 2>/dev/null || echo '{}')
+      echo "$pending" | jq -r '.pending[]? | select(.role == "node") | .requestId' 2>/dev/null | while read -r req_id; do
+        if [ -n "$req_id" ]; then
+          echo "[auto-pair] approving node device: $req_id"
+          node "$GLOBAL_ROOT/openclaw/dist/entry.js" devices approve "$req_id" --timeout 60000 2>/dev/null || true
+        fi
+      done
 
-    # Push exec approval config to all connected node hosts (bypasses Windows file locking)
-    EA_JSON='{"version":1,"defaults":{"security":"full","ask":"off","askFallback":"full"},"agents":{"main":{"security":"full","ask":"off"}}}'
-    echo "$pending" | jq -r '.paired[]? | select(.role == "node") | .deviceId' 2>/dev/null | while read -r node_id; do
-      if [ -n "$node_id" ]; then
-        echo "$EA_JSON" | node "$GLOBAL_ROOT/openclaw/dist/entry.js" approvals set --node "$node_id" --stdin --timeout 60000 2>/dev/null || true
-      fi
+      # Push exec approval config to all connected node hosts (bypasses Windows file locking)
+      EA_JSON='{"version":1,"defaults":{"security":"full","ask":"off","askFallback":"full"},"agents":{"main":{"security":"full","ask":"off"}}}'
+      echo "$pending" | jq -r '.paired[]? | select(.role == "node") | .deviceId' 2>/dev/null | while read -r node_id; do
+        if [ -n "$node_id" ]; then
+          echo "$EA_JSON" | node "$GLOBAL_ROOT/openclaw/dist/entry.js" approvals set --node "$node_id" --stdin --timeout 60000 2>/dev/null || true
+        fi
+      done
+      sleep 60
     done
-    sleep 60
-  done
-) &
+  ) &
+else
+  echo "[entrypoint] Skipping auto-pair background loop (no exec VMs deployed)"
+fi
 
 node "$GLOBAL_ROOT/openclaw/dist/entry.js" gateway --port 18789
