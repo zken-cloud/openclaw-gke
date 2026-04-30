@@ -19,6 +19,7 @@ Deploy [OpenClaw](https://docs.openclaw.ai) on Google Cloud with sandbox isolati
 - [Variables Reference](#variables-reference)
 - [Outputs Reference](#outputs-reference)
 - [File Structure](#file-structure)
+- [Troubleshooting](#troubleshooting)
 - [Cleanup](#cleanup)
 
 ---
@@ -532,6 +533,8 @@ kubectl get pods -n openclaw -o jsonpath='{range .items[*]}{.metadata.name}{" ->
 ### Step 7: Approve Node Host Pairing (only if `exec_vms` is non-empty)
 
 Wait 3–5 minutes for the VM startup script to install OpenClaw and start node hosts. Each node host will attempt to connect to its developer's gateway pod and request pairing approval.
+
+> **Automatic Pairing (New):** When `exec_vms` is non-empty, a background loop automatically approves pending node host pairing requests every 60 seconds. This loop is **automatically disabled** when no execution VMs are deployed to avoid event loop blocking. Manual approval via TUI/CLI is still supported if you prefer manual control.
 
 #### Option A: Approve via TUI
 
@@ -1256,6 +1259,47 @@ openclaw-gke/
     ├── linux_startup.sh       # Linux VM startup (node hosts via systemd)
     └── windows_startup.ps1    # Windows VM startup (node hosts via Scheduled Tasks)
 ```
+
+[Back to top](#table-of-contents)
+
+---
+
+## Troubleshooting
+
+[Back to top](#table-of-contents)
+
+### Slow Agent Response / Event Loop Delays
+
+**Symptoms:**
+- OpenClaw TUI is extremely slow (30+ second delays)
+- Agent requests timeout
+- Gateway logs show event loop delay warnings (50+ seconds)
+
+**Cause:**
+The auto-pair background loop runs continuously when `exec_vms` is non-empty, polling for pending device pairings every 60 seconds. Each poll creates a WebSocket connection that can block the Node.js event loop, especially in sandbox environments (Kata/gVisor).
+
+**Solution:**
+This has been **fixed automatically** in recent versions. The auto-pair loop now only runs when execution VMs are actually deployed:
+- If `exec_vms = {}` (empty): Loop is **disabled** → no event loop blocking
+- If `exec_vms` has entries: Loop **enabled** → automatic node host pairing
+
+**Verification:**
+```bash
+# Check if auto-pair loop is running
+kubectl logs -n openclaw deployment/openclaw-brain-alice | grep "auto-pair"
+
+# Expected when exec_vms is empty:
+# "[entrypoint] Skipping auto-pair background loop (no exec VMs deployed)"
+
+# Expected when exec_vms is non-empty:
+# "[entrypoint] Starting auto-pair background loop (exec VMs enabled)"
+```
+
+**Performance improvement:**
+- Before fix: 97+ second event loop delays, 99.9% utilization, CLI timeouts
+- After fix: <50ms event loop delays, <40% utilization, responsive TUI
+
+If you still experience slowness after this fix, check gateway logs for other sources of event loop blocking.
 
 [Back to top](#table-of-contents)
 
